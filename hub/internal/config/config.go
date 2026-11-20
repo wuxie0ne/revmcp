@@ -16,6 +16,9 @@ type Config struct {
 	AgentSigningSecret  string         `yaml:"agent_signing_secret"`
 	AuditLogPath        string         `yaml:"audit_log_path"`
 	MaxInflightPerAgent int            `yaml:"max_inflight_per_agent"`
+	RateLimitRPS        float64        `yaml:"rate_limit_rps"`
+	RateLimitBurst      int            `yaml:"rate_limit_burst"`
+	RevokedJTIs         []string       `yaml:"revoked_jtis"`
 	Clients             []ClientConfig `yaml:"clients"`
 }
 
@@ -57,6 +60,15 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxInflightPerAgent <= 0 {
 		c.MaxInflightPerAgent = 16
+	}
+	if c.RateLimitRPS < 0 {
+		return fmt.Errorf("config: rate_limit_rps cannot be negative")
+	}
+	if c.RateLimitBurst < 0 {
+		return fmt.Errorf("config: rate_limit_burst cannot be negative")
+	}
+	if c.RateLimitRPS > 0 && c.RateLimitBurst == 0 {
+		c.RateLimitBurst = max(1, int(c.RateLimitRPS*2))
 	}
 	if strings.TrimSpace(c.AuditLogPath) == "" {
 		c.AuditLogPath = "-"

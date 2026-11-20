@@ -40,17 +40,33 @@ func (t tagFlags) Set(v string) error {
 	return nil
 }
 
+type listFlags []string
+
+func (l *listFlags) String() string { return strings.Join(*l, ",") }
+
+func (l *listFlags) Set(v string) error {
+	trimmed := strings.TrimSpace(v)
+	if trimmed == "" {
+		return errors.New("empty path pattern")
+	}
+	*l = append(*l, trimmed)
+	return nil
+}
+
 func main() {
 	var (
-		hubURL       string
-		token        string
-		caCertPath   string
-		targetID     string
-		modeRaw      string
-		ttl          time.Duration
-		selfDestruct bool
-		showVersion  bool
-		tags         = make(tagFlags)
+		hubURL        string
+		token         string
+		caCertPath    string
+		targetID      string
+		modeRaw       string
+		ttl           time.Duration
+		selfDestruct  bool
+		noDefaultDeny bool
+		showVersion   bool
+		allowPaths    listFlags
+		denyPaths     listFlags
+		tags          = make(tagFlags)
 	)
 
 	flag.StringVar(&hubURL, "hub", "", "Hub WebSocket URL (e.g. wss://mcp.example.com/agent/ws or ws://host:9443/agent/ws)")
@@ -60,7 +76,10 @@ func main() {
 	flag.StringVar(&modeRaw, "mode", string(proto.ModeReadOnly), "Permission mode: readonly | restricted | full")
 	flag.DurationVar(&ttl, "ttl", 0, "Optional auto-exit duration (e.g. 2h)")
 	flag.BoolVar(&selfDestruct, "self-destruct-on-exit", false, "Remove agent binary from disk upon exit")
+	flag.BoolVar(&noDefaultDeny, "no-default-deny", false, "Disable built-in sensitive path denylist for fs.read/fs.grep")
 	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
+	flag.Var(&allowPaths, "allow-path", "Optional allowed file path glob/prefix for fs.read/fs.grep (repeatable)")
+	flag.Var(&denyPaths, "deny-path", "Optional denied file path glob/prefix for fs.read/fs.grep (repeatable)")
 	flag.Var(tags, "tag", "Optional target metadata tag in key=value format (repeatable)")
 	flag.Parse()
 
@@ -118,6 +137,12 @@ func main() {
 	sessions := executor.NewSessionPool(executor.SessionConfig{})
 	defer sessions.CloseAll()
 
+	fileReader := fsread.NewReader(fsread.Policy{
+		AllowPaths:    allowPaths,
+		DenyPaths:     denyPaths,
+		NoDefaultDeny: noDefaultDeny,
+	})
+
 	var remoteSelfDestruct bool
 	var client *tunnel.Client
 
@@ -170,11 +195,13 @@ func main() {
 			if err := json.Unmarshal(req.Params, &p); err != nil {
 				return nil, &proto.RPCError{Code: proto.ErrCodeInvalidArgument, Message: err.Error()}
 			}
-			res, err := fsread.Read(p)
+			res, err := fileReader.Read(p)
 			if err != nil {
 				code := proto.ErrCodeInternal
 				if errors.Is(err, os.ErrNotExist) {
 					code = proto.ErrCodeNotFound
+				} else if errors.Is(err, fsread.ErrPathDenied) {
+					code = proto.ErrCodePolicyDenied
 				} else if errors.Is(err, fsread.ErrInvalidPath) {
 					code = proto.ErrCodeInvalidArgument
 				}
@@ -187,11 +214,13 @@ func main() {
 			if err := json.Unmarshal(req.Params, &p); err != nil {
 				return nil, &proto.RPCError{Code: proto.ErrCodeInvalidArgument, Message: err.Error()}
 			}
-			res, err := fsread.Grep(p)
+			res, err := fileReader.Grep(p)
 			if err != nil {
 				code := proto.ErrCodeInternal
 				if errors.Is(err, os.ErrNotExist) {
 					code = proto.ErrCodeNotFound
+				} else if errors.Is(err, fsread.ErrPathDenied) {
+					code = proto.ErrCodePolicyDenied
 				} else if errors.Is(err, fsread.ErrInvalidPath) {
 					code = proto.ErrCodeInvalidArgument
 				}

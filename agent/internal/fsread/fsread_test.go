@@ -73,3 +73,58 @@ func TestGrepBounded(t *testing.T) {
 		t.Fatalf("unexpected match line numbers: %+v", res.Matches)
 	}
 }
+
+func TestPathPolicyDenyAllowAndSymlink(t *testing.T) {
+	t.Parallel()
+
+	// Default denylist must block high-value paths even before opening them.
+	defaultReader := NewReader(DefaultPolicy())
+	for _, sensitive := range []string{"/etc/shadow", "/proc/1/environ", "/root/.ssh/id_rsa", "/home/alice/.ssh/id_ed25519"} {
+		if _, err := defaultReader.Read(proto.FSReadRequest{Path: sensitive}); !errors.Is(err, ErrPathDenied) {
+			t.Fatalf("expected ErrPathDenied for %q, got: %v", sensitive, err)
+		}
+	}
+
+	// Custom deny + symlink escape attempt must be rejected.
+	dir := t.TempDir()
+	secretDir := filepath.Join(dir, "secrets")
+	publicDir := filepath.Join(dir, "public")
+	if err := os.MkdirAll(secretDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(publicDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	secretFile := filepath.Join(secretDir, "key.pem")
+	publicFile := filepath.Join(publicDir, "app.log")
+	if err := os.WriteFile(secretFile, []byte("SECRET"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(publicFile, []byte("OK\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	escapeLink := filepath.Join(publicDir, "escape.log")
+	if err := os.Symlink(secretFile, escapeLink); err != nil {
+		t.Fatal(err)
+	}
+
+	restricted := NewReader(Policy{
+		AllowPaths: []string{publicDir + "/*"},
+		DenyPaths:  []string{secretDir + "/*"},
+	})
+	if res, err := restricted.Read(proto.FSReadRequest{Path: publicFile}); err != nil || res.Content != "OK\n" {
+		t.Fatalf("expected allowed file read to succeed, res=%+v err=%v", res, err)
+	}
+	if _, err := restricted.Read(proto.FSReadRequest{Path: secretFile}); !errors.Is(err, ErrPathDenied) {
+		t.Fatalf("expected ErrPathDenied for denied file, got: %v", err)
+	}
+	if _, err := restricted.Read(proto.FSReadRequest{Path: escapeLink}); !errors.Is(err, ErrPathDenied) {
+		t.Fatalf("expected ErrPathDenied for symlink escaping into denied/unallowed dir, got: %v", err)
+	}
+
+	// NoDefaultDeny disables built-in denylist.
+	noDefault := NewReader(Policy{NoDefaultDeny: true})
+	if err := noDefault.checkPathPolicy("/etc/shadow"); err != nil {
+		t.Fatalf("expected NoDefaultDeny to allow policy check, got: %v", err)
+	}
+}

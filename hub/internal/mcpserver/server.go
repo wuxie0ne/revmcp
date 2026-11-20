@@ -28,6 +28,7 @@ type Gateway struct {
 	version     string
 	registry    *registry.Registry
 	audit       *policy.AuditLogger
+	limiter     *policy.RateLimiter
 	schemaCache *mcp.SchemaCache
 	aggServer   *mcp.Server
 }
@@ -42,6 +43,25 @@ func NewGateway(version string, reg *registry.Registry, audit *policy.AuditLogge
 	}
 	g.aggServer = g.buildServer("")
 	return g
+}
+
+// SetRateLimiter attaches an optional per-caller/target token-bucket rate limiter.
+func (g *Gateway) SetRateLimiter(rl *policy.RateLimiter) {
+	g.limiter = rl
+}
+
+func (g *Gateway) checkRateLimit(info *sdkauth.TokenInfo, targetID string) error {
+	if g.limiter == nil {
+		return nil
+	}
+	user := "anonymous"
+	if info != nil && info.UserID != "" {
+		user = info.UserID
+	}
+	if !g.limiter.Allow(user + ":" + targetID) {
+		return fmt.Errorf("rate limit exceeded for %s on target %q", user, targetID)
+	}
+	return nil
 }
 
 // RegisterRoutes mounts /mcp and /mcp/{target_id} behind auth.RequireBearerToken.
@@ -406,6 +426,10 @@ func (g *Gateway) execCommand(ctx context.Context, req *mcp.CallToolRequest, tar
 		g.auditCall(traceID, info, targetID, "exec_command", args, "deny", err.Error(), nil, time.Since(start), false)
 		return nil, nil, err
 	}
+	if err := g.checkRateLimit(info, targetID); err != nil {
+		g.auditCall(traceID, info, targetID, "exec_command", args, "deny", err.Error(), nil, time.Since(start), false)
+		return nil, nil, err
+	}
 
 	entry, ok := g.registry.Get(targetID)
 	if !ok {
@@ -414,7 +438,12 @@ func (g *Gateway) execCommand(ctx context.Context, req *mcp.CallToolRequest, tar
 		return nil, nil, err
 	}
 
-	// Defense in depth: if the target runs in full mode and caller lacks exec:full, fail closed.
+	// Defense in depth: readonly targets reject exec_command at Hub as well; full targets require exec:full.
+	if entry.Info.Mode == proto.ModeReadOnly {
+		err := fmt.Errorf("target %q is in readonly mode; command execution is disabled", targetID)
+		g.auditCall(traceID, info, targetID, "exec_command", args, "deny", err.Error(), nil, time.Since(start), false)
+		return nil, nil, err
+	}
 	if entry.Info.Mode == proto.ModeFull && !policy.HasScope(info.Scopes, policy.ScopeExecFull) {
 		err := fmt.Errorf("target %q is in full mode; caller requires %q scope", targetID, policy.ScopeExecFull)
 		g.auditCall(traceID, info, targetID, "exec_command", args, "deny", err.Error(), nil, time.Since(start), false)
@@ -434,6 +463,14 @@ func (g *Gateway) execCommand(ctx context.Context, req *mcp.CallToolRequest, tar
 
 func (g *Gateway) execShellSession(ctx context.Context, req *mcp.CallToolRequest, targetID, action, sessionID, command, workdir string) (*mcp.CallToolResult, any, error) {
 	args := map[string]any{"action": action, "session_id": sessionID, "command": command, "workdir": workdir}
+
+	// Defense in depth: verify target is online and in full mode before invoking session RPCs.
+	if entry, ok := g.registry.Get(targetID); ok && entry.Info.Mode != proto.ModeFull {
+		err := fmt.Errorf("target %q is in %s mode; shell_session requires full mode", targetID, entry.Info.Mode)
+		g.auditCall(newTraceID(), tokenInfo(req), targetID, "shell_session", args, "deny", err.Error(), nil, 0, false)
+		return nil, nil, err
+	}
+
 	switch action {
 	case "open":
 		var res proto.SessionOpenResult
@@ -473,6 +510,10 @@ func (g *Gateway) callAgent(
 	info := tokenInfo(req)
 
 	if err := policy.Authorize(info, requiredScope, targetID); err != nil {
+		g.auditCall(traceID, info, targetID, toolName, auditArgs, "deny", err.Error(), nil, time.Since(start), false)
+		return err
+	}
+	if err := g.checkRateLimit(info, targetID); err != nil {
 		g.auditCall(traceID, info, targetID, toolName, auditArgs, "deny", err.Error(), nil, time.Since(start), false)
 		return err
 	}

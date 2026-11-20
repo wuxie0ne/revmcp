@@ -90,6 +90,9 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
+	for _, jti := range cfg.RevokedJTIs {
+		signer.Revoke(jti)
+	}
 	verifier, err := hubauth.NewStaticBearerVerifier(cfg.Clients)
 	if err != nil {
 		return err
@@ -101,8 +104,11 @@ func runServe(args []string) error {
 	defer func() { _ = audit.Close() }()
 
 	reg := registry.New()
-	tunnelSrv := tunnel.NewServer(signer, reg, version, cfg.MaxInflightPerAgent, logger)
+	tunnelSrv := tunnel.NewServer(signer, reg, audit, version, cfg.MaxInflightPerAgent, logger)
 	mcpGW := mcpserver.NewGateway(version, reg, audit)
+	if rl := policy.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst); rl != nil {
+		mcpGW.SetRateLimiter(rl)
+	}
 
 	healthHandler := func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)

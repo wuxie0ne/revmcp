@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	sdkauth "github.com/modelcontextprotocol/go-sdk/auth"
 	hubauth "github.com/revmcp/revmcp/hub/internal/auth"
@@ -83,5 +84,32 @@ func TestAuditLoggerRedactsSecrets(t *testing.T) {
 	}
 	if decoded.ArgsRedacted["token"] != "[REDACTED]" {
 		t.Fatalf("expected redacted token, got: %v", decoded.ArgsRedacted["token"])
+	}
+}
+
+func TestRateLimiterAllowAndRefill(t *testing.T) {
+	t.Parallel()
+
+	rl := NewRateLimiter(2, 2)
+	now := time.Now()
+	rl.now = func() time.Time { return now }
+
+	if !rl.Allow("alice:prod-01") {
+		t.Fatal("expected 1st call in burst to be allowed")
+	}
+	if !rl.Allow("alice:prod-01") {
+		t.Fatal("expected 2nd call in burst to be allowed")
+	}
+	if rl.Allow("alice:prod-01") {
+		t.Fatal("expected 3rd immediate call to be rate limited")
+	}
+	// Separate key has its own bucket.
+	if !rl.Allow("bob:prod-01") {
+		t.Fatal("expected different key to be allowed")
+	}
+	// Advance clock by 600ms -> refills 1.2 tokens.
+	now = now.Add(600 * time.Millisecond)
+	if !rl.Allow("alice:prod-01") {
+		t.Fatal("expected call after refill to be allowed")
 	}
 }

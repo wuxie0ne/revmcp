@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
+	"strings"
 
 	"github.com/revmcp/revmcp/proto"
 )
@@ -23,7 +25,76 @@ const (
 var (
 	// ErrInvalidPath indicates a missing or unsupported path (e.g., directory, FIFO, or device file).
 	ErrInvalidPath = errors.New("fsread: invalid or unsupported file path")
+	// ErrPathDenied indicates the path was blocked by agent allow/deny path policy.
+	ErrPathDenied = errors.New("fsread: path denied by policy")
 )
+
+// DefaultDenyPaths protects high-value host credential files even in readonly mode.
+var DefaultDenyPaths = []string{
+	"/etc/shadow",
+	"/etc/shadow-",
+	"/etc/gshadow",
+	"/etc/gshadow-",
+	"/proc/*/environ",
+	"/proc/*/mem",
+	"/proc/kcore",
+	"/root/.ssh/*",
+	"/home/*/.ssh/*",
+	"/etc/kubernetes/pki/*",
+}
+
+// Policy controls which filesystem paths the agent permits for fs.read and fs.grep.
+type Policy struct {
+	AllowPaths    []string
+	DenyPaths     []string
+	NoDefaultDeny bool
+}
+
+// DefaultPolicy returns a Policy enforcing DefaultDenyPaths.
+func DefaultPolicy() Policy {
+	return Policy{}
+}
+
+// Reader performs policy-checked, bounded file reads and regex grep operations.
+type Reader struct {
+	allowPatterns []string
+	denyPatterns  []string
+}
+
+// NewReader constructs a Reader enforcing p (combining DefaultDenyPaths unless NoDefaultDeny is true).
+func NewReader(p Policy) *Reader {
+	var denies []string
+	if !p.NoDefaultDeny {
+		denies = append(denies, DefaultDenyPaths...)
+	}
+	for _, pat := range p.DenyPaths {
+		if trimmed := strings.TrimSpace(pat); trimmed != "" {
+			denies = append(denies, filepath.Clean(trimmed))
+		}
+	}
+
+	var allows []string
+	for _, pat := range p.AllowPaths {
+		if trimmed := strings.TrimSpace(pat); trimmed != "" {
+			allows = append(allows, filepath.Clean(trimmed))
+		}
+	}
+
+	return &Reader{
+		allowPatterns: allows,
+		denyPatterns:  denies,
+	}
+}
+
+// Read is a convenience wrapper using DefaultPolicy.
+func Read(req proto.FSReadRequest) (*proto.FSReadResult, error) {
+	return NewReader(DefaultPolicy()).Read(req)
+}
+
+// Grep is a convenience wrapper using DefaultPolicy.
+func Grep(req proto.FSGrepRequest) (*proto.FSGrepResult, error) {
+	return NewReader(DefaultPolicy()).Grep(req)
+}
 
 func clampMaxBytes(v int) int {
 	if v <= 0 {
@@ -35,11 +106,74 @@ func clampMaxBytes(v int) int {
 	return v
 }
 
-func openSafeFile(rawPath string) (*os.File, os.FileInfo, error) {
-	if rawPath == "" {
+func (r *Reader) checkPathPolicy(cleanedPath string) error {
+	candidates := []string{cleanedPath}
+	if resolved, err := filepath.EvalSymlinks(cleanedPath); err == nil && resolved != "" && resolved != cleanedPath {
+		candidates = append(candidates, filepath.Clean(resolved))
+	}
+
+	for _, c := range candidates {
+		for _, deny := range r.denyPatterns {
+			if matchPathPattern(deny, c) {
+				return fmt.Errorf("%w: %q matches deny rule %q", ErrPathDenied, cleanedPath, deny)
+			}
+		}
+	}
+
+	if len(r.allowPatterns) > 0 {
+		// Check the canonical resolved path (last candidate) against allowPatterns.
+		target := candidates[len(candidates)-1]
+		allowed := false
+		for _, allow := range r.allowPatterns {
+			if matchPathPattern(allow, target) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("%w: %q is outside configured --allow-path rules", ErrPathDenied, cleanedPath)
+		}
+	}
+
+	return nil
+}
+
+func matchPathPattern(pattern, candidate string) bool {
+	if pattern == candidate {
+		return true
+	}
+	if matched, err := path.Match(pattern, candidate); err == nil && matched {
+		return true
+	}
+	// Support recursive prefix rules when pattern ends with "/*" (e.g. "/var/log/*") or is a directory prefix.
+	if strings.HasSuffix(pattern, "/*") {
+		prefix := strings.TrimSuffix(pattern, "*")
+		if strings.HasPrefix(candidate, prefix) {
+			return true
+		}
+		// Handle wildcard intermediate directories such as "/home/*/.ssh/*".
+		dirPat := strings.TrimSuffix(pattern, "/*")
+		for cur := path.Dir(candidate); cur != "/" && cur != "."; cur = path.Dir(cur) {
+			if matched, err := path.Match(dirPat, cur); err == nil && matched {
+				return true
+			}
+		}
+	}
+	if strings.HasPrefix(candidate, pattern+"/") {
+		return true
+	}
+	return false
+}
+
+func (r *Reader) openSafeFile(rawPath string) (*os.File, os.FileInfo, error) {
+	if strings.TrimSpace(rawPath) == "" {
 		return nil, nil, fmt.Errorf("%w: empty path", ErrInvalidPath)
 	}
 	cleaned := filepath.Clean(rawPath)
+	if err := r.checkPathPolicy(cleaned); err != nil {
+		return nil, nil, err
+	}
+
 	fi, err := os.Stat(cleaned)
 	if err != nil {
 		return nil, nil, err
@@ -59,9 +193,9 @@ func openSafeFile(rawPath string) (*os.File, os.FileInfo, error) {
 	return f, fi, nil
 }
 
-// Read returns a bounded chunk (by offset) or tail (by tail_lines) of a file.
-func Read(req proto.FSReadRequest) (*proto.FSReadResult, error) {
-	f, fi, err := openSafeFile(req.Path)
+// Read returns a bounded chunk (when Offset is set) or tail (by tail_lines) of a file.
+func (r *Reader) Read(req proto.FSReadRequest) (*proto.FSReadResult, error) {
+	f, fi, err := r.openSafeFile(req.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -112,7 +246,7 @@ func Read(req proto.FSReadRequest) (*proto.FSReadResult, error) {
 	}, nil
 }
 
-func readTail(f *os.File, path string, size int64, tailLines, maxBytes int) (*proto.FSReadResult, error) {
+func readTail(f *os.File, filePath string, size int64, tailLines, maxBytes int) (*proto.FSReadResult, error) {
 	start := size - int64(maxBytes)
 	if start < 0 {
 		start = 0
@@ -149,7 +283,7 @@ func readTail(f *os.File, path string, size int64, tailLines, maxBytes int) (*pr
 	content := data[cutIdx:]
 	actualOffset := start + int64(cutIdx)
 	return &proto.FSReadResult{
-		Path:       path,
+		Path:       filePath,
 		Content:    string(content),
 		Offset:     actualOffset,
 		BytesRead:  len(content),
@@ -160,7 +294,7 @@ func readTail(f *os.File, path string, size int64, tailLines, maxBytes int) (*pr
 }
 
 // Grep streams a file line-by-line and returns bounded regex matches.
-func Grep(req proto.FSGrepRequest) (*proto.FSGrepResult, error) {
+func (r *Reader) Grep(req proto.FSGrepRequest) (*proto.FSGrepResult, error) {
 	if req.Pattern == "" {
 		return nil, fmt.Errorf("%w: empty pattern", ErrInvalidPath)
 	}
@@ -169,7 +303,7 @@ func Grep(req proto.FSGrepRequest) (*proto.FSGrepResult, error) {
 		return nil, fmt.Errorf("fsread: compile regex: %w", err)
 	}
 
-	f, _, err := openSafeFile(req.Path)
+	f, _, err := r.openSafeFile(req.Path)
 	if err != nil {
 		return nil, err
 	}

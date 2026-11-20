@@ -1,12 +1,14 @@
 package tunnel
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -105,6 +107,23 @@ func dialTestAgent(t *testing.T, wsURL, token string, info proto.AgentInfo, hand
 	}
 }
 
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
 func TestHubTunnelRoundTripTraceAndCancel(t *testing.T) {
 	t.Parallel()
 
@@ -113,7 +132,9 @@ func TestHubTunnelRoundTripTraceAndCancel(t *testing.T) {
 		t.Fatalf("NewEnrollmentSigner: %v", err)
 	}
 	reg := registry.New()
-	srv := NewServer(signer, reg, "test", 8, nil)
+	var auditBuf syncBuffer
+	audit := policy.NewAuditLoggerWithWriter(&auditBuf)
+	srv := NewServer(signer, reg, audit, "test", 8, nil)
 
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
@@ -191,5 +212,42 @@ func TestHubTunnelRoundTripTraceAndCancel(t *testing.T) {
 	case <-canceledCh:
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected remote agent handler to cancel promptly")
+	}
+
+	// 3. Different instance_id taking over active target must emit high-severity audit warning.
+	_, cleanup2 := dialTestAgent(t, wsURL, tok, proto.AgentInfo{
+		TargetID:   "prod-01",
+		InstanceID: "inst-2-intruder",
+		Mode:       proto.ModeRestricted,
+	}, func(_ context.Context, _ proto.Request) (any, *proto.RPCError) {
+		return &proto.PingResult{}, nil
+	})
+	defer cleanup2()
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(auditBuf.String(), "agent.register.takeover") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.Contains(auditBuf.String(), "agent.register.takeover") || !strings.Contains(auditBuf.String(), "inst-2-intruder") {
+		t.Fatalf("expected high-severity takeover audit entry, got: %s", auditBuf.String())
+	}
+
+	// 4. Revoked JTI must be rejected with 401 on subsequent dial.
+	claims, err := signer.Verify(tok)
+	if err != nil {
+		t.Fatalf("Verify tok: %v", err)
+	}
+	signer.Revoke(claims.JTI)
+	_, respRevoked, err := websocket.Dial(context.Background(), wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + tok}},
+	})
+	if respRevoked != nil && respRevoked.Body != nil {
+		_ = respRevoked.Body.Close()
+	}
+	if err == nil || (respRevoked != nil && respRevoked.StatusCode != http.StatusUnauthorized) {
+		t.Fatalf("expected 401 for revoked token, err=%v resp=%v", err, respRevoked)
 	}
 }

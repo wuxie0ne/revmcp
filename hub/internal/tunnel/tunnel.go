@@ -30,13 +30,14 @@ const (
 type Server struct {
 	signer      *auth.EnrollmentSigner
 	registry    *registry.Registry
+	audit       *policy.AuditLogger
 	hubVersion  string
 	maxInflight int
 	logger      *slog.Logger
 }
 
 // NewServer constructs a southbound tunnel server.
-func NewServer(signer *auth.EnrollmentSigner, reg *registry.Registry, hubVersion string, maxInflight int, logger *slog.Logger) *Server {
+func NewServer(signer *auth.EnrollmentSigner, reg *registry.Registry, audit *policy.AuditLogger, hubVersion string, maxInflight int, logger *slog.Logger) *Server {
 	if maxInflight <= 0 {
 		maxInflight = 16
 	}
@@ -46,6 +47,7 @@ func NewServer(signer *auth.EnrollmentSigner, reg *registry.Registry, hubVersion
 	return &Server{
 		signer:      signer,
 		registry:    reg,
+		audit:       audit,
 		hubVersion:  hubVersion,
 		maxInflight: maxInflight,
 		logger:      logger,
@@ -102,11 +104,30 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	caller := newSessionCaller(session, connCancel, wsConn, s.maxInflight)
 	entry, replaced := s.registry.Register(agentInfo, caller)
 	if replaced != nil {
+		differentInstance := replaced.Info.InstanceID != "" && agentInfo.InstanceID != "" && replaced.Info.InstanceID != agentInfo.InstanceID
 		s.logger.Warn("replacing existing agent connection",
 			"target_id", agentInfo.TargetID,
 			"old_instance", replaced.Info.InstanceID,
 			"new_instance", agentInfo.InstanceID,
+			"different_instance", differentInstance,
+			"jti", claims.JTI,
 		)
+		if differentInstance && s.audit != nil {
+			_ = s.audit.Log(policy.AuditEntry{
+				TraceID:  newRequestID(),
+				User:     "agent:" + claims.TargetID,
+				TargetID: agentInfo.TargetID,
+				Tool:     "agent.register.takeover",
+				ArgsRedacted: map[string]any{
+					"old_instance_id": replaced.Info.InstanceID,
+					"new_instance_id": agentInfo.InstanceID,
+					"jti":             claims.JTI,
+					"mode":            string(agentInfo.Mode),
+				},
+				Decision: "allow",
+				Reason:   "high_severity_takeover: different instance_id replaced active target connection",
+			})
+		}
 		_ = replaced.Caller.Close()
 	}
 

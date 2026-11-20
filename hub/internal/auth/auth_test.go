@@ -39,10 +39,23 @@ func TestEnrollmentTokenSignAndVerify(t *testing.T) {
 		t.Fatalf("expected ErrInvalidEnrollmentToken on tamper, got: %v", err)
 	}
 
+	// Revoked JTI must fail closed immediately.
+	signer.Revoke(issued.JTI)
+	if !signer.IsRevoked(issued.JTI) {
+		t.Fatal("expected IsRevoked to return true")
+	}
+	if _, err := signer.Verify(tok); !errors.Is(err, ErrInvalidEnrollmentToken) {
+		t.Fatalf("expected ErrInvalidEnrollmentToken on revoked jti, got: %v", err)
+	}
+
 	// Expired token must fail closed.
+	tok2, _, err := signer.Issue("prod-web-02", proto.ModeReadOnly, time.Hour)
+	if err != nil {
+		t.Fatalf("Issue tok2 failed: %v", err)
+	}
 	now := time.Now()
 	signer.now = func() time.Time { return now.Add(2 * time.Hour) }
-	if _, err := signer.Verify(tok); !errors.Is(err, ErrInvalidEnrollmentToken) {
+	if _, err := signer.Verify(tok2); !errors.Is(err, ErrInvalidEnrollmentToken) {
 		t.Fatalf("expected ErrInvalidEnrollmentToken on expiry, got: %v", err)
 	}
 }

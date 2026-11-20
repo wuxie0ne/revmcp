@@ -9,14 +9,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/revmcp/revmcp/proto"
 )
 
 var (
-	// ErrInvalidEnrollmentToken indicates a malformed, forged, or expired enrollment token.
+	// ErrInvalidEnrollmentToken indicates a malformed, forged, revoked, or expired enrollment token.
 	ErrInvalidEnrollmentToken = errors.New("auth: invalid enrollment token")
 )
 
@@ -28,10 +30,12 @@ type EnrollmentClaims struct {
 	JTI      string     `json:"jti"`
 }
 
-// EnrollmentSigner signs and verifies HMAC-SHA256 short-lived enrollment tokens.
+// EnrollmentSigner signs, verifies, and tracks revocations for HMAC-SHA256 enrollment tokens.
 type EnrollmentSigner struct {
-	secret []byte
-	now    func() time.Time
+	secret  []byte
+	now     func() time.Time
+	mu      sync.RWMutex
+	revoked map[string]struct{}
 }
 
 // NewEnrollmentSigner creates an EnrollmentSigner from a shared secret.
@@ -40,9 +44,41 @@ func NewEnrollmentSigner(secret string) (*EnrollmentSigner, error) {
 		return nil, fmt.Errorf("auth: signing secret must be at least 16 bytes")
 	}
 	return &EnrollmentSigner{
-		secret: []byte(secret),
-		now:    time.Now,
+		secret:  []byte(secret),
+		now:     time.Now,
+		revoked: make(map[string]struct{}),
 	}, nil
+}
+
+// Revoke adds a token JTI to the revocation list so future handshakes with it fail closed.
+func (s *EnrollmentSigner) Revoke(jti string) {
+	trimmed := strings.TrimSpace(jti)
+	if trimmed == "" {
+		return
+	}
+	s.mu.Lock()
+	s.revoked[trimmed] = struct{}{}
+	s.mu.Unlock()
+}
+
+// IsRevoked reports whether jti has been revoked.
+func (s *EnrollmentSigner) IsRevoked(jti string) bool {
+	s.mu.RLock()
+	_, ok := s.revoked[strings.TrimSpace(jti)]
+	s.mu.RUnlock()
+	return ok
+}
+
+// RevokedJTIs returns a sorted snapshot of all revoked token JTIs.
+func (s *EnrollmentSigner) RevokedJTIs() []string {
+	s.mu.RLock()
+	out := make([]string, 0, len(s.revoked))
+	for jti := range s.revoked {
+		out = append(out, jti)
+	}
+	s.mu.RUnlock()
+	sort.Strings(out)
+	return out
 }
 
 // Issue generates a signed short-lived enrollment token for targetID and maxMode.
@@ -81,7 +117,7 @@ func (s *EnrollmentSigner) Issue(targetID string, maxMode proto.Mode, ttl time.D
 	return encodedPayload + "." + encodedMAC, claims, nil
 }
 
-// Verify validates signature, expiration, target_id, and max_mode, failing closed on any error.
+// Verify validates signature, expiration, revocation, target_id, and max_mode, failing closed on any error.
 func (s *EnrollmentSigner) Verify(token string) (*EnrollmentClaims, error) {
 	encodedPayload, encodedMAC, ok := strings.Cut(strings.TrimSpace(token), ".")
 	if !ok || encodedPayload == "" || encodedMAC == "" {
@@ -114,6 +150,9 @@ func (s *EnrollmentSigner) Verify(token string) (*EnrollmentClaims, error) {
 	}
 	if claims.Exp <= s.now().Unix() {
 		return nil, fmt.Errorf("%w: token expired", ErrInvalidEnrollmentToken)
+	}
+	if s.IsRevoked(claims.JTI) {
+		return nil, fmt.Errorf("%w: token revoked", ErrInvalidEnrollmentToken)
 	}
 
 	return &claims, nil
