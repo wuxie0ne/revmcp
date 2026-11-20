@@ -72,7 +72,7 @@ func main() {
 	flag.StringVar(&hubURL, "hub", "", "Hub WebSocket URL (e.g. wss://mcp.example.com/agent/ws or ws://host:9443/agent/ws)")
 	flag.StringVar(&token, "token", "", "Short-lived enrollment token (or REVMCP_ENROLL_TOKEN env)")
 	flag.StringVar(&caCertPath, "ca-cert", "", "Optional PEM CA certificate path for private/self-signed Hub TLS")
-	flag.StringVar(&targetID, "target-id", "", "Optional target ID (defaults to enrollment token target or hostname)")
+	flag.StringVar(&targetID, "target-id", "", "Target ID (required for channel credentials)")
 	flag.StringVar(&modeRaw, "mode", string(proto.ModeReadOnly), "Permission mode: readonly | restricted | full")
 	flag.DurationVar(&ttl, "ttl", 0, "Optional auto-exit duration (e.g. 2h)")
 	flag.BoolVar(&selfDestruct, "self-destruct-on-exit", false, "Remove agent binary from disk upon exit")
@@ -129,7 +129,8 @@ func main() {
 		kernel = sys.Kernel
 		inContainer = sys.InContainer
 	}
-	if targetID == "" {
+	targetIDExplicit := targetID != ""
+	if !targetIDExplicit {
 		targetID = hostname
 	}
 
@@ -314,9 +315,10 @@ func main() {
 	}
 
 	client, err = tunnel.NewClient(tunnel.Config{
-		HubURL:     hubURL,
-		Token:      token,
-		CACertPath: caCertPath,
+		HubURL:           hubURL,
+		Token:            token,
+		CACertPath:       caCertPath,
+		TargetIDExplicit: targetIDExplicit,
 		AgentInfo: proto.AgentInfo{
 			TargetID:    targetID,
 			InstanceID:  randomHex(8),

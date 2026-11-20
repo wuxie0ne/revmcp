@@ -122,8 +122,9 @@ type AgentInfo struct {
 
 // RegisterRequest is sent on the initial agent->hub stream after WebSocket upgrade.
 type RegisterRequest struct {
-	ProtoVersion int       `json:"proto_version"`
-	Agent        AgentInfo `json:"agent"`
+	ProtoVersion     int       `json:"proto_version"`
+	Agent            AgentInfo `json:"agent"`
+	TargetIDExplicit bool      `json:"target_id_explicit,omitempty"`
 }
 
 // RegisterResponse acknowledges registration on the initial stream.

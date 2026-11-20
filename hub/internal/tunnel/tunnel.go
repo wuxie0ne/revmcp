@@ -10,25 +10,29 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"path"
 	"strings"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/hashicorp/yamux"
 	"github.com/revmcp/revmcp/hub/internal/auth"
+	"github.com/revmcp/revmcp/hub/internal/channel"
 	"github.com/revmcp/revmcp/hub/internal/policy"
 	"github.com/revmcp/revmcp/hub/internal/registry"
 	"github.com/revmcp/revmcp/proto"
 )
 
 const (
-	wsReadLimitBytes = 4 * 1024 * 1024
-	registerTimeout  = 10 * time.Second
+	wsReadLimitBytes     = 4 * 1024 * 1024
+	registerTimeout      = 10 * time.Second
+	registerReplyTimeout = 2 * time.Second
 )
 
 // Server accepts outbound WebSocket connections from agents and bridges them into yamux sessions.
 type Server struct {
 	signer      *auth.EnrollmentSigner
+	channels    *channel.Store
 	registry    *registry.Registry
 	audit       *policy.AuditLogger
 	hubVersion  string
@@ -54,12 +58,25 @@ func NewServer(signer *auth.EnrollmentSigner, reg *registry.Registry, audit *pol
 	}
 }
 
+func (s *Server) UseChannels(store *channel.Store) { s.channels = store }
+
+func (s *Server) authorize(token string) error {
+	if !channel.Managed(token) {
+		_, err := s.signer.Verify(token)
+		return err
+	}
+	if s.channels == nil {
+		return channel.ErrDenied
+	}
+	_, _, err := s.channels.Verify(token, channel.Agent)
+	return err
+}
+
 // ServeHTTP upgrades an authenticated agent WebSocket connection, performs registration,
 // and keeps the tunnel registered until the session closes.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	token := extractBearer(r.Header.Get("Authorization"))
-	claims, err := s.signer.Verify(token)
-	if err != nil {
+	if err := s.authorize(token); err != nil {
 		http.Error(w, "unauthorized enrollment token", http.StatusUnauthorized)
 		return
 	}
@@ -92,46 +109,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	agentInfo, err := s.handleRegister(session, claims)
+	caller := newSessionCaller(session, connCancel, wsConn, s.maxInflight)
+	entry, channelID, err := s.handleRegister(session, caller, token)
 	if err != nil {
-		s.logger.Warn("agent registration failed", "target_id", claims.TargetID, "err", err)
-		_ = session.Close()
-		connCancel()
-		_ = wsConn.Close(websocket.StatusPolicyViolation, "registration rejected")
+		s.logger.Warn("agent registration failed", "err", err)
+		_ = caller.Close()
 		return
 	}
-
-	caller := newSessionCaller(session, connCancel, wsConn, s.maxInflight)
-	entry, replaced := s.registry.Register(agentInfo, caller)
-	if replaced != nil {
-		differentInstance := replaced.Info.InstanceID != "" && agentInfo.InstanceID != "" && replaced.Info.InstanceID != agentInfo.InstanceID
-		s.logger.Warn("replacing existing agent connection",
-			"target_id", agentInfo.TargetID,
-			"old_instance", replaced.Info.InstanceID,
-			"new_instance", agentInfo.InstanceID,
-			"different_instance", differentInstance,
-			"jti", claims.JTI,
-		)
-		if differentInstance && s.audit != nil {
-			_ = s.audit.Log(policy.AuditEntry{
-				TraceID:  newRequestID(),
-				User:     "agent:" + claims.TargetID,
-				TargetID: agentInfo.TargetID,
-				Tool:     "agent.register.takeover",
-				ArgsRedacted: map[string]any{
-					"old_instance_id": replaced.Info.InstanceID,
-					"new_instance_id": agentInfo.InstanceID,
-					"jti":             claims.JTI,
-					"mode":            string(agentInfo.Mode),
-				},
-				Decision: "allow",
-				Reason:   "high_severity_takeover: different instance_id replaced active target connection",
-			})
-		}
-		_ = replaced.Caller.Close()
-	}
+	agentInfo := entry.Info
 
 	s.logger.Info("agent online",
+		"channel_id", channelID,
 		"target_id", agentInfo.TargetID,
 		"mode", agentInfo.Mode,
 		"arch", agentInfo.Arch,
@@ -139,12 +127,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 
 	<-session.CloseChan()
-	s.registry.Unregister(agentInfo.TargetID, entry.Generation)
+	s.registry.UnregisterIn(channelID, agentInfo.TargetID, entry.Generation)
 	_ = caller.Close()
-	s.logger.Info("agent offline", "target_id", agentInfo.TargetID)
+	s.logger.Info("agent offline", "channel_id", channelID, "target_id", agentInfo.TargetID)
 }
 
-func (s *Server) handleRegister(session *yamux.Session, claims *auth.EnrollmentClaims) (proto.AgentInfo, error) {
+func (s *Server) handleRegister(session *yamux.Session, caller *sessionCaller, token string) (*registry.Entry, string, error) {
 	type acceptResult struct {
 		stream *yamux.Stream
 		err    error
@@ -159,68 +147,165 @@ func (s *Server) handleRegister(session *yamux.Session, claims *auth.EnrollmentC
 	select {
 	case res := <-ch:
 		if res.err != nil {
-			return proto.AgentInfo{}, fmt.Errorf("accept register stream: %w", res.err)
+			return nil, "", fmt.Errorf("accept register stream: %w", res.err)
 		}
 		stream = res.stream
 	case <-time.After(registerTimeout):
-		return proto.AgentInfo{}, errors.New("register handshake timeout")
+		return nil, "", errors.New("register handshake timeout")
 	}
 	defer func() { _ = stream.Close() }()
 
-	_ = stream.SetDeadline(time.Now().Add(registerTimeout))
+	deadline := time.Now().Add(registerTimeout)
+	_ = stream.SetDeadline(deadline)
 
 	var req proto.Request
 	if err := proto.ReadFrame(stream, &req); err != nil {
-		return proto.AgentInfo{}, fmt.Errorf("read register request: %w", err)
+		return nil, "", fmt.Errorf("read register request: %w", err)
 	}
 	if req.Method != proto.MethodAgentRegister {
 		_ = proto.WriteFrame(stream, proto.Response{
 			ID:    req.ID,
 			Error: &proto.RPCError{Code: proto.ErrCodeInvalidArgument, Message: "expected agent.register"},
 		})
-		return proto.AgentInfo{}, fmt.Errorf("unexpected initial method %q", req.Method)
+		return nil, "", fmt.Errorf("unexpected initial method %q", req.Method)
 	}
 
 	var regReq proto.RegisterRequest
 	if err := json.Unmarshal(req.Params, &regReq); err != nil {
-		return proto.AgentInfo{}, fmt.Errorf("unmarshal register params: %w", err)
+		return nil, "", fmt.Errorf("unmarshal register params: %w", err)
 	}
 	if regReq.ProtoVersion != proto.ProtocolVersion {
 		_ = proto.WriteFrame(stream, proto.Response{
 			ID:    req.ID,
 			Error: &proto.RPCError{Code: proto.ErrCodeUnsupported, Message: "unsupported protocol version"},
 		})
-		return proto.AgentInfo{}, fmt.Errorf("unsupported proto_version %d", regReq.ProtoVersion)
+		return nil, "", fmt.Errorf("unsupported proto_version %d", regReq.ProtoVersion)
 	}
 
-	agentMode, err := proto.ParseMode(string(regReq.Agent.Mode))
-	if err != nil || !claims.MaxMode.Allows(agentMode) {
-		_ = proto.WriteFrame(stream, proto.Response{
-			ID:    req.ID,
-			Error: &proto.RPCError{Code: proto.ErrCodeModeDenied, Message: "agent mode exceeds enrollment token max_mode"},
+	reply := func() error {
+		result, err := json.Marshal(proto.RegisterResponse{Accepted: true, HubVersion: s.hubVersion})
+		if err != nil {
+			return err
+		}
+		// yamux can block in its session send queue beyond a stream deadline.
+		// Cancel the transport to bound the entire response write.
+		remaining := min(registerReplyTimeout, time.Until(deadline))
+		if remaining <= 0 {
+			return errors.New("register response timeout")
+		}
+		timer := time.AfterFunc(remaining, func() {
+			caller.connCancel()
+			_ = caller.wsConn.CloseNow()
 		})
-		return proto.AgentInfo{}, fmt.Errorf("agent mode %q exceeds token max_mode %q", regReq.Agent.Mode, claims.MaxMode)
+		err = proto.WriteFrame(stream, proto.Response{ID: req.ID, Result: result})
+		if !timer.Stop() {
+			return errors.New("register response timeout")
+		}
+		return err
+	}
+	entry, channelID, err := s.register(token, regReq, caller, reply)
+	var rpcErr *proto.RPCError
+	if errors.As(err, &rpcErr) {
+		_ = proto.WriteFrame(stream, proto.Response{ID: req.ID, Error: rpcErr})
+	}
+	return entry, channelID, err
+}
+
+func (s *Server) register(token string, req proto.RegisterRequest, caller *sessionCaller, reply func() error) (*registry.Entry, string, error) {
+	if !channel.Managed(token) {
+		mode, err := proto.ParseMode(string(req.Agent.Mode))
+		if err != nil {
+			return nil, "", &proto.RPCError{Code: proto.ErrCodeModeDenied, Message: "invalid Agent mode"}
+		}
+		info := req.Agent
+		info.Mode = mode
+		entry, err := s.registerLegacy(token, info, caller, reply)
+		return entry, "", err
+	}
+	if s.channels == nil {
+		return nil, "", channel.ErrDenied
 	}
 
-	// Authoritatively bind target_id from the signed enrollment token.
-	info := regReq.Agent
-	info.TargetID = claims.TargetID
-	info.Mode = agentMode
-
-	resultRaw, err := json.Marshal(proto.RegisterResponse{
-		Accepted:   true,
-		HubVersion: s.hubVersion,
+	start := time.Now()
+	info := req.Agent
+	var entry *registry.Entry
+	channelID, err := s.channels.AdmitAgent(token, func(record channel.Record) error {
+		matches, _ := path.Match(record.Policy.Target, info.TargetID)
+		if !req.TargetIDExplicit || !channel.ValidName(info.TargetID) || !matches {
+			return &proto.RPCError{Code: proto.ErrCodeInvalidArgument, Message: "explicit target ID matching the channel target rule is required"}
+		}
+		mode, err := proto.ParseMode(string(info.Mode))
+		if err != nil || !record.Policy.Mode.Allows(mode) {
+			return &proto.RPCError{Code: proto.ErrCodeModeDenied, Message: "invalid Agent mode or mode exceeds channel maximum"}
+		}
+		info.Mode = mode
+		var reserved bool
+		entry, reserved = s.registry.Reserve(record.ID, info, caller)
+		if !reserved {
+			return &proto.RPCError{Code: proto.ErrCodeInvalidArgument, Message: "target already connected in channel"}
+		}
+		if err := reply(); err != nil {
+			s.registry.UnregisterIn(record.ID, info.TargetID, entry.Generation)
+			return err
+		}
+		s.registry.Activate(record.ID, info.TargetID, entry.Generation)
+		return nil
 	})
+	reason, decision := "registered", "allow"
 	if err != nil {
-		return proto.AgentInfo{}, err
+		reason, decision = "registration failed", "deny"
+		var rpcErr *proto.RPCError
+		if errors.As(err, &rpcErr) {
+			reason = rpcErr.Message
+		}
 	}
-	if err := proto.WriteFrame(stream, proto.Response{
-		ID:     req.ID,
-		Result: resultRaw,
-	}); err != nil {
-		return proto.AgentInfo{}, fmt.Errorf("write register response: %w", err)
+	targetID := ""
+	if channelID != "" && channel.ValidName(info.TargetID) {
+		targetID = info.TargetID
 	}
-	return info, nil
+	s.auditRegistration(channelID, targetID, decision, reason, time.Since(start))
+	return entry, channelID, err
+}
+
+func (s *Server) registerLegacy(token string, info proto.AgentInfo, caller *sessionCaller, reply func() error) (*registry.Entry, error) {
+	claims, err := s.signer.Verify(token)
+	if err != nil {
+		return nil, err
+	}
+	if !claims.MaxMode.Allows(info.Mode) {
+		return nil, &proto.RPCError{Code: proto.ErrCodeModeDenied, Message: "agent mode exceeds enrollment token max_mode"}
+	}
+	info.TargetID = claims.TargetID
+	if err := reply(); err != nil {
+		return nil, err
+	}
+	entry, replaced := s.registry.Register(info, caller)
+	if replaced != nil {
+		if replaced.Info.InstanceID != "" && info.InstanceID != "" && replaced.Info.InstanceID != info.InstanceID {
+			if s.audit != nil {
+				_ = s.audit.Log(policy.AuditEntry{
+					TraceID: newRequestID(), User: "agent:" + info.TargetID, TargetID: info.TargetID,
+					Tool: "agent.register.takeover", Decision: "allow",
+					Reason: "high_severity_takeover: different instance_id replaced active target connection",
+					ArgsRedacted: map[string]any{
+						"old_instance_id": replaced.Info.InstanceID, "new_instance_id": info.InstanceID,
+						"jti": claims.JTI, "mode": string(info.Mode),
+					},
+				})
+			}
+		}
+		_ = replaced.Caller.Close()
+	}
+	return entry, nil
+}
+
+func (s *Server) auditRegistration(channelID, targetID, decision, reason string, duration time.Duration) {
+	if s.audit != nil {
+		_ = s.audit.Log(policy.AuditEntry{
+			TraceID: newRequestID(), User: "agent:" + targetID, ChannelID: channelID, TargetID: targetID,
+			Tool: "agent.register", Decision: decision, Reason: reason, DurationMS: duration.Milliseconds(),
+		})
+	}
 }
 
 type sessionCaller struct {

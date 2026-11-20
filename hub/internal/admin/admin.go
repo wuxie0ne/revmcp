@@ -11,6 +11,7 @@ import (
 
 	sdkauth "github.com/modelcontextprotocol/go-sdk/auth"
 	hubauth "github.com/revmcp/revmcp/hub/internal/auth"
+	"github.com/revmcp/revmcp/hub/internal/channel"
 	"github.com/revmcp/revmcp/hub/internal/policy"
 	"github.com/revmcp/revmcp/hub/internal/registry"
 	"github.com/revmcp/revmcp/proto"
@@ -48,6 +49,7 @@ type Handler struct {
 	registry *registry.Registry
 	signer   *hubauth.EnrollmentSigner
 	audit    *policy.AuditLogger
+	channels *channel.Store
 }
 
 // NewHandler creates an Admin HTTP Handler.
@@ -108,6 +110,10 @@ func (h *Handler) handleListTargets(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleShutdownTarget(w http.ResponseWriter, r *http.Request) {
+	h.shutdownTarget(w, r, "")
+}
+
+func (h *Handler) shutdownTarget(w http.ResponseWriter, r *http.Request, channelID string) {
 	start := time.Now()
 	traceID := newTraceID()
 	info := sdkauth.TokenInfoFromContext(r.Context())
@@ -117,6 +123,7 @@ func (h *Handler) handleShutdownTarget(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil {
 		defer func() { _ = r.Body.Close() }()
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&payload); err != nil && err.Error() != "EOF" {
+			h.auditEvent(traceID, info, channelID, targetID, "admin.shutdown", nil, "deny", "invalid json payload", time.Since(start))
 			writeJSONError(w, http.StatusBadRequest, "invalid json payload")
 			return
 		}
@@ -124,15 +131,15 @@ func (h *Handler) handleShutdownTarget(w http.ResponseWriter, r *http.Request) {
 
 	args := map[string]any{"reason": payload.Reason, "self_destruct": payload.SelfDestruct}
 	if err := policy.Authorize(info, policy.ScopeAdmin, targetID); err != nil {
-		h.auditEvent(traceID, info, targetID, "admin.shutdown", args, "deny", err.Error(), time.Since(start))
+		h.auditEvent(traceID, info, channelID, targetID, "admin.shutdown", args, "deny", err.Error(), time.Since(start))
 		writeJSONError(w, http.StatusForbidden, err.Error())
 		return
 	}
 
-	entry, ok := h.registry.Get(targetID)
+	entry, ok := h.registry.GetIn(channelID, targetID)
 	if !ok {
 		msg := fmt.Sprintf("target %q is offline", targetID)
-		h.auditEvent(traceID, info, targetID, "admin.shutdown", args, "deny", msg, time.Since(start))
+		h.auditEvent(traceID, info, channelID, targetID, "admin.shutdown", args, "deny", msg, time.Since(start))
 		writeJSONError(w, http.StatusNotFound, msg)
 		return
 	}
@@ -143,12 +150,12 @@ func (h *Handler) handleShutdownTarget(w http.ResponseWriter, r *http.Request) {
 		Reason:       payload.Reason,
 		SelfDestruct: payload.SelfDestruct,
 	}, &res); err != nil {
-		h.auditEvent(traceID, info, targetID, "admin.shutdown", args, "deny", err.Error(), time.Since(start))
+		h.auditEvent(traceID, info, channelID, targetID, "admin.shutdown", args, "deny", err.Error(), time.Since(start))
 		writeJSONError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 
-	h.auditEvent(traceID, info, targetID, "admin.shutdown", args, "allow", "", time.Since(start))
+	h.auditEvent(traceID, info, channelID, targetID, "admin.shutdown", args, "allow", "", time.Since(start))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"accepted":      res.Accepted,
 		"target_id":     targetID,
@@ -162,7 +169,7 @@ func (h *Handler) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 	info := sdkauth.TokenInfoFromContext(r.Context())
 
 	if err := policy.Authorize(info, policy.ScopeAdmin, ""); err != nil {
-		h.auditEvent(traceID, info, "", "admin.token.revoke", nil, "deny", err.Error(), time.Since(start))
+		h.auditEvent(traceID, info, "", "", "admin.token.revoke", nil, "deny", err.Error(), time.Since(start))
 		writeJSONError(w, http.StatusForbidden, err.Error())
 		return
 	}
@@ -184,7 +191,7 @@ func (h *Handler) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.signer.Revoke(jti)
-	h.auditEvent(traceID, info, "", "admin.token.revoke", map[string]any{"jti": jti}, "allow", "", time.Since(start))
+	h.auditEvent(traceID, info, "", "", "admin.token.revoke", map[string]any{"jti": jti}, "allow", "", time.Since(start))
 	writeJSON(w, http.StatusOK, map[string]any{"revoked": true, "jti": jti})
 }
 
@@ -197,7 +204,7 @@ func (h *Handler) handleListRevoked(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"revoked_jtis": h.signer.RevokedJTIs()})
 }
 
-func (h *Handler) auditEvent(traceID string, info *sdkauth.TokenInfo, targetID, tool string, args map[string]any, decision, reason string, dur time.Duration) {
+func (h *Handler) auditEvent(traceID string, info *sdkauth.TokenInfo, channelID, targetID, tool string, args map[string]any, decision, reason string, dur time.Duration) {
 	if h.audit == nil {
 		return
 	}
@@ -208,6 +215,7 @@ func (h *Handler) auditEvent(traceID string, info *sdkauth.TokenInfo, targetID, 
 	_ = h.audit.Log(policy.AuditEntry{
 		TraceID:      traceID,
 		User:         user,
+		ChannelID:    channelID,
 		TargetID:     targetID,
 		Tool:         tool,
 		ArgsRedacted: args,

@@ -13,6 +13,7 @@ import (
 
 // AuditEntry represents one structured JSONL audit log line emitted for every tools/call.
 type AuditEntry struct {
+	ChannelID    string         `json:"channel_id,omitempty"`
 	Timestamp    time.Time      `json:"ts"`
 	TraceID      string         `json:"trace_id"`
 	User         string         `json:"user"`

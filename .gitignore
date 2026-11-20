@@ -9,6 +9,8 @@ coverage.txt
 *.local.yaml
 *.local.yml
 audit.jsonl
+revmcp-tokens.json
+revmcp-tokens.json.lock
 .env
 .env.*
 

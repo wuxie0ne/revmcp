@@ -30,14 +30,15 @@ type Handler func(ctx context.Context, req proto.Request) (any, *proto.RPCError)
 
 // Config holds outbound WSS/WS + yamux connection parameters for the agent.
 type Config struct {
-	HubURL         string
-	Token          string
-	CACertPath     string
-	InitialBackoff time.Duration
-	MaxBackoff     time.Duration
-	AgentInfo      proto.AgentInfo
-	Handler        Handler
-	Logger         *slog.Logger
+	HubURL           string
+	Token            string
+	CACertPath       string
+	InitialBackoff   time.Duration
+	MaxBackoff       time.Duration
+	AgentInfo        proto.AgentInfo
+	TargetIDExplicit bool
+	Handler          Handler
+	Logger           *slog.Logger
 }
 
 // Client manages the persistent outbound tunnel to Hub with exponential backoff reconnect.
@@ -223,8 +224,9 @@ func (c *Client) register(session *yamux.Session) error {
 	_ = stream.SetDeadline(time.Now().Add(10 * time.Second))
 
 	params, err := json.Marshal(proto.RegisterRequest{
-		ProtoVersion: proto.ProtocolVersion,
-		Agent:        c.cfg.AgentInfo,
+		ProtoVersion:     proto.ProtocolVersion,
+		Agent:            c.cfg.AgentInfo,
+		TargetIDExplicit: c.cfg.TargetIDExplicit,
 	})
 	if err != nil {
 		return err

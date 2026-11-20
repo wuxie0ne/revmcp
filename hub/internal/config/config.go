@@ -11,15 +11,17 @@ import (
 
 // Config holds the runtime configuration for revmcp-hub.
 type Config struct {
-	Listen              string         `yaml:"listen"`
-	TunnelListen        string         `yaml:"tunnel_listen"`
-	AgentSigningSecret  string         `yaml:"agent_signing_secret"`
-	AuditLogPath        string         `yaml:"audit_log_path"`
-	MaxInflightPerAgent int            `yaml:"max_inflight_per_agent"`
-	RateLimitRPS        float64        `yaml:"rate_limit_rps"`
-	RateLimitBurst      int            `yaml:"rate_limit_burst"`
-	RevokedJTIs         []string       `yaml:"revoked_jtis"`
-	Clients             []ClientConfig `yaml:"clients"`
+	Listen              string           `yaml:"listen"`
+	TunnelListen        string           `yaml:"tunnel_listen"`
+	AgentSigningSecret  string           `yaml:"agent_signing_secret"`
+	AuditLogPath        string           `yaml:"audit_log_path"`
+	MaxInflightPerAgent int              `yaml:"max_inflight_per_agent"`
+	RateLimitRPS        float64          `yaml:"rate_limit_rps"`
+	RateLimitBurst      int              `yaml:"rate_limit_burst"`
+	RevokedJTIs         []string         `yaml:"revoked_jtis"`
+	Clients             []ClientConfig   `yaml:"clients"`
+	Tokens              *ChannelsConfig  `yaml:"tokens"`
+	Management          ManagementConfig `yaml:"management"`
 }
 
 // ClientConfig defines an authorized northbound MCP API client.
@@ -45,6 +47,7 @@ func Load(path string) (*Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	cfg.resolveStatePath(path)
 	return &cfg, nil
 }
 
@@ -97,5 +100,5 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("config: client %q must define at least one allowed_targets pattern", cl.Name)
 		}
 	}
-	return nil
+	return c.validateChannels()
 }

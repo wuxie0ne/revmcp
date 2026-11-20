@@ -1,0 +1,31 @@
+# Copy to a local configuration and change the listen address if needed.
+listen: "127.0.0.1:8443"
+agent_signing_secret: "${REVMCP_SIGNING_SECRET}"
+audit_log_path: "-"
+
+management:
+  # Read by the management CLI. Use the Hub's management URL.
+  hub_url: "http://127.0.0.1:8443"
+  admin_client: "token-admin"
+
+tokens:
+  mcp_signing_secret: "${REVMCP_MCP_SIGNING_SECRET}"
+  # Relative to this YAML file. Its parent directory must be writable.
+  state_path: "./revmcp-tokens.json"
+  defaults:
+    agent_mode: "readonly"
+    agent_ttl: "2h"
+    mcp_scopes: ["read"]
+    mcp_ttl: "24h"
+  profiles:
+    single:
+      target: "remote-99"
+    fleet:
+      target: "open-*"
+      agent_ttl: "30m"
+
+clients:
+  - name: "token-admin"
+    token_sha256: "${REVMCP_ADMIN_TOKEN_SHA256}"
+    scopes: ["admin"]
+    allowed_targets: ["*"]

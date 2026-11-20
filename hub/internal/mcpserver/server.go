@@ -58,7 +58,7 @@ func (g *Gateway) checkRateLimit(info *sdkauth.TokenInfo, targetID string) error
 	if info != nil && info.UserID != "" {
 		user = info.UserID
 	}
-	if !g.limiter.Allow(user + ":" + targetID) {
+	if !g.limiter.Allow(hubauth.ChannelID(info) + ":" + user + ":" + targetID) {
 		return fmt.Errorf("rate limit exceeded for %s on target %q", user, targetID)
 	}
 	return nil
@@ -350,7 +350,7 @@ func (g *Gateway) handleListTargets(_ context.Context, req *mcp.CallToolRequest,
 
 	tagKey, tagVal, _ := strings.Cut(strings.TrimSpace(in.Tag), "=")
 	allowed := hubauth.AllowedTargetsFromToken(info)
-	entries := g.registry.List(tagKey, tagVal)
+	entries := g.registry.ListIn(hubauth.ChannelID(info), tagKey, tagVal)
 
 	out := ListTargetsOutput{Targets: make([]TargetSummary, 0, len(entries))}
 	for _, e := range entries {
@@ -431,7 +431,7 @@ func (g *Gateway) execCommand(ctx context.Context, req *mcp.CallToolRequest, tar
 		return nil, nil, err
 	}
 
-	entry, ok := g.registry.Get(targetID)
+	entry, ok := g.registry.GetIn(hubauth.ChannelID(info), targetID)
 	if !ok {
 		err := fmt.Errorf("target %q is offline", targetID)
 		g.auditCall(traceID, info, targetID, "exec_command", args, "deny", err.Error(), nil, time.Since(start), false)
@@ -465,7 +465,7 @@ func (g *Gateway) execShellSession(ctx context.Context, req *mcp.CallToolRequest
 	args := map[string]any{"action": action, "session_id": sessionID, "command": command, "workdir": workdir}
 
 	// Defense in depth: verify target is online and in full mode before invoking session RPCs.
-	if entry, ok := g.registry.Get(targetID); ok && entry.Info.Mode != proto.ModeFull {
+	if entry, ok := g.registry.GetIn(hubauth.ChannelID(tokenInfo(req)), targetID); ok && entry.Info.Mode != proto.ModeFull {
 		err := fmt.Errorf("target %q is in %s mode; shell_session requires full mode", targetID, entry.Info.Mode)
 		g.auditCall(newTraceID(), tokenInfo(req), targetID, "shell_session", args, "deny", err.Error(), nil, 0, false)
 		return nil, nil, err
@@ -518,7 +518,7 @@ func (g *Gateway) callAgent(
 		return err
 	}
 
-	entry, ok := g.registry.Get(targetID)
+	entry, ok := g.registry.GetIn(hubauth.ChannelID(info), targetID)
 	if !ok {
 		err := fmt.Errorf("target %q is offline", targetID)
 		g.auditCall(traceID, info, targetID, toolName, auditArgs, "deny", err.Error(), nil, time.Since(start), false)
@@ -554,6 +554,7 @@ func (g *Gateway) auditCall(
 	_ = g.audit.Log(policy.AuditEntry{
 		TraceID:      traceID,
 		User:         user,
+		ChannelID:    hubauth.ChannelID(info),
 		TargetID:     targetID,
 		Tool:         tool,
 		ArgsRedacted: args,

@@ -4,7 +4,6 @@ import (
 	"context"
 	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/revmcp/revmcp/proto"
@@ -22,81 +21,124 @@ type Entry struct {
 	Caller      Caller
 	ConnectedAt time.Time
 	Generation  uint64
+	pending     bool
 }
 
-// Registry maintains a concurrency-safe map of online Agents keyed by target_id.
+type key struct {
+	channelID string
+	targetID  string
+}
+
+// Registry indexes online Agents by channel and target. An empty channel is the legacy namespace.
 type Registry struct {
 	mu      sync.RWMutex
-	entries map[string]*Entry
-	gen     atomic.Uint64
+	entries map[key]*Entry
+	gen     uint64
 }
 
-// New creates an empty Registry.
 func New() *Registry {
-	return &Registry{
-		entries: make(map[string]*Entry),
-	}
+	return &Registry{entries: make(map[key]*Entry)}
 }
 
-// Register adds or smoothly replaces an online agent for info.TargetID.
-// If an older connection exists for the same TargetID, it is returned so the caller can close it.
-func (r *Registry) Register(info proto.AgentInfo, caller Caller) (entry *Entry, replaced *Entry) {
-	gen := r.gen.Add(1)
-	entry = &Entry{
-		Info:        info,
-		Caller:      caller,
-		ConnectedAt: time.Now().UTC(),
-		Generation:  gen,
-	}
-
-	r.mu.Lock()
-	replaced = r.entries[info.TargetID]
-	r.entries[info.TargetID] = entry
-	r.mu.Unlock()
-
-	return entry, replaced
-}
-
-// Unregister removes targetID only if the stored entry matches generation, preventing
-// a stale disconnected session from evicting a newer reconnect.
-func (r *Registry) Unregister(targetID string, generation uint64) bool {
+func (r *Registry) Register(info proto.AgentInfo, caller Caller) (entry, replaced *Entry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	k := key{targetID: info.TargetID}
+	replaced = r.entries[k]
+	return r.add(k, info, caller, false), replaced
+}
 
-	cur, ok := r.entries[targetID]
+// Reserve refuses a second connection for a managed target, including one still registering.
+func (r *Registry) Reserve(channelID string, info proto.AgentInfo, caller Caller) (*Entry, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	k := key{channelID, info.TargetID}
+	if _, exists := r.entries[k]; exists {
+		return nil, false
+	}
+	return r.add(k, info, caller, true), true
+}
+
+func (r *Registry) add(k key, info proto.AgentInfo, caller Caller, pending bool) *Entry {
+	r.gen++
+	entry := &Entry{Info: info, Caller: caller, Generation: r.gen, ConnectedAt: time.Now().UTC(), pending: pending}
+	r.entries[k] = entry
+	return entry
+}
+
+func (r *Registry) Activate(channelID, targetID string, generation uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if entry := r.entries[key{channelID, targetID}]; entry != nil && entry.Generation == generation {
+		entry.pending = false
+	}
+}
+
+func (r *Registry) Unregister(targetID string, generation uint64) bool {
+	return r.UnregisterIn("", targetID, generation)
+}
+
+func (r *Registry) UnregisterIn(channelID, targetID string, generation uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	k := key{channelID, targetID}
+	cur, ok := r.entries[k]
 	if !ok || cur.Generation != generation {
 		return false
 	}
-	delete(r.entries, targetID)
+	delete(r.entries, k)
 	return true
 }
 
-// Get returns the active Entry for targetID, if online.
 func (r *Registry) Get(targetID string) (*Entry, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	entry, ok := r.entries[targetID]
-	return entry, ok
+	return r.GetIn("", targetID)
 }
 
-// List returns all currently online targets sorted by TargetID, optionally filtered by a tag key=value.
-func (r *Registry) List(tagKey, tagVal string) []*Entry {
+func (r *Registry) GetIn(channelID, targetID string) (*Entry, bool) {
 	r.mu.RLock()
-	out := make([]*Entry, 0, len(r.entries))
-	for _, entry := range r.entries {
+	defer r.mu.RUnlock()
+	entry, ok := r.entries[key{channelID, targetID}]
+	if !ok || entry.pending {
+		return nil, false
+	}
+	return entry, true
+}
+
+func (r *Registry) List(tagKey, tagVal string) []*Entry {
+	return r.ListIn("", tagKey, tagVal)
+}
+
+func (r *Registry) ListIn(channelID, tagKey, tagVal string) []*Entry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]*Entry, 0)
+	for k, entry := range r.entries {
+		if k.channelID != channelID || entry.pending {
+			continue
+		}
 		if tagKey != "" {
-			v, ok := entry.Info.Tags[tagKey]
-			if !ok || (tagVal != "" && v != tagVal) {
+			value, ok := entry.Info.Tags[tagKey]
+			if !ok || tagVal != "" && value != tagVal {
 				continue
 			}
 		}
 		out = append(out, entry)
 	}
-	r.mu.RUnlock()
-
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].Info.TargetID < out[j].Info.TargetID
 	})
 	return out
+}
+
+func (r *Registry) Detach(channelID string) []Caller {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var callers []Caller
+	for k, entry := range r.entries {
+		if k.channelID == channelID {
+			callers = append(callers, entry.Caller)
+			delete(r.entries, k)
+		}
+	}
+	return callers
 }
