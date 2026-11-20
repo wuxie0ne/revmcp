@@ -26,6 +26,10 @@ make lint
 # 跨平台静态构建与校验
 make build
 make verify-static
+
+# 容器兼容性实测（已验证通过 alpine:3.20 与 centos:7）
+docker build -f deploy/Dockerfile.compat-test --target alpine-check .
+docker build -f deploy/Dockerfile.compat-test --target centos7-check .
 ```
 
 ## 3. 生产部署参考

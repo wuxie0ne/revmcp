@@ -22,7 +22,7 @@
                                                        |  | Tunnel Manager (WSS + hashicorp/yamux) |  |
                                                        |  +-------------------+--------------------+  |
                                                        +----------------------|-----------------------+
-                                                                              | 主动出站 WSS (443)
+                                                                              | 主动出站 WSS/WS (自定义端口)
                                                                               | Yamux Multiplexing
                                                        +----------------------v-----------------------+
                                                        |            Agent (Static Binary)             |
@@ -83,20 +83,29 @@
 | `session.open/exec/close` | Hub -> Agent | 持久化有状态 Shell 会话管理 | `full` |
 | `agent.shutdown` | Hub -> Agent | 远程踢下线，可选 `self_destruct: true` 清理自身二进制 | 全部 |
 
-## 4. 北向 MCP 协议与 Tool 契约
+## 4. 北向 MCP 协议与 Admin 接口契约
 
-- 使用 `github.com/modelcontextprotocol/go-sdk` 的 `mcp.NewStreamableHTTPHandler(..., &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true})`。
-- 全量路由受 `auth.RequireBearerToken` 保护，处理器内通过 `req.Extra.TokenInfo` 核验 `Scopes` 和 `allowed_targets`。
+### MCP 端点
+- 使用 `github.com/modelcontextprotocol/go-sdk` 的 `mcp.NewStreamableHTTPHandler(..., &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true})`（注：`Stateless: true` 下 `GET`/`DELETE` 返回 `405 Method Not Allowed`），并在单机隔离 Server 间复用 `mcp.NewSchemaCache()`。
+- 全量路由受 `auth.RequireBearerToken` 保护（静态 API Key 启用 `AllowMissingExpiration: true`），处理器内通过 `req.Extra.TokenInfo` 核验 `Scopes` 和 `allowed_targets`。
 - 路由策略：
   - `/mcp`：聚合端点，所有远程工具均接收 `target_id`；
   - `/mcp/{target_id}`：单机隔离端点，工具 Schema 隐藏 `target_id`，在路由层绑定目标并校验权限，防止跨机误操作。
-- 所有来自目标机的不可信文本输出必须包裹在 `<remote_output target="..." exit_code="..." truncated="...">...</remote_output>` 边界标签中。
+- 所有来自目标机的不可信文本输出必须包裹在 `<remote_output target="..." exit_code="..." truncated="...">...</remote_output>` 边界标签中（并对内嵌 `</remote_output>` 转义）。
 
-## 5. Agent 命令执行与安全防爆
+### Admin HTTP API（仅挂载于北向 `listen`，不暴露为 MCP Tool）
+均要求 Bearer Token 携带 `admin` scope：
+- `GET /admin/targets`：查询在线目标机（按调用者 `allowed_targets` 过滤，支持 `?tag=k=v`）。
+- `POST /admin/targets/{target_id}/shutdown`：向目标机下发 `agent.shutdown`（支持 `{"reason":"...","self_destruct":true}`）并记录审计日志。
+- `POST /admin/tokens/revoke`：按 `{"jti":"..."}` 吊销南向注册 Token 并记录审计日志。
+- `GET /admin/tokens/revoked`：查看当前已吊销的 `jti` 列表。
+
+## 5. Agent 命令执行、会话池与安全防爆
 
 1. **进程组隔离与查杀**：`cmd.Stdin = nil` + `SysProcAttr{Setpgid: true}` + 取消/超时后 `syscall.Kill(-pid, syscall.SIGKILL)`。
 2. **首尾保留截断缓冲区（`HeadTailBuffer`）**：默认上限 `32KB`（最大 `128KB`），保留头部 `25%` + 环形尾部 `75%`，避免内存膨胀。
-3. **AST 受限命令校验（`--mode restricted`）**：使用 `mvdan.cc/sh/v3/syntax` 解析完整 AST，禁止命令替换、进程替换、重定向写盘、非白名单命令、子命令危险参数（如 `find -exec`、`sed -i`、`awk system()`），解析失败一律 Fail-Closed。
+3. **AST 受限命令校验（`--mode restricted`）**：使用 `mvdan.cc/sh/v3/syntax` 解析完整 AST，禁止命令替换、进程替换、重定向写盘、非白名单命令、子命令危险参数（如 `find -exec`、`dmesg -C`、危险 `docker`/`kubectl` 子命令），解析失败一律 Fail-Closed。
+4. **有状态会话池（`--mode full`）**：每次命令使用唯一随机 Sentinel 边界标记解析退出码，保留 `cd` 与环境变量，受最大并发会话数与空闲超时自动回收约束，退出或超时查杀整个进程组并 `Wait()` 回收确保零僵尸进程。
 
 ## 6. 安全与审计模型
 
