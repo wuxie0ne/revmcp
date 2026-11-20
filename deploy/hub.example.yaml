@@ -15,6 +15,13 @@ audit_log_path: "/var/log/revmcp/audit.jsonl"
 # Optional maximum concurrent RPC calls per agent (0 = default 16).
 max_inflight_per_agent: 16
 
+# Optional per-caller/target token-bucket rate limit (0 = unlimited).
+rate_limit_rps: 10
+rate_limit_burst: 20
+
+# Optional list of revoked enrollment token JTIs loaded at startup.
+revoked_jtis: []
+
 # Northbound MCP clients authenticated via Authorization: Bearer <token>.
 # Generate sha256 hex digest with: printf '%s' '<your-secret-token>' | sha256sum
 clients:

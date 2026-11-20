@@ -100,6 +100,8 @@
 
 ## 6. 安全与审计模型
 
-- **南向注册认证**：HMAC-SHA256 短效 Enrollment Token，包含 `target_id`、`exp`、`max_mode`、`jti` 与签名；Hub 强制校验签名、有效期且拒绝 Agent 声明高于 Token 允许的 `mode`。
-- **北向 API 认证**：Bearer Token（配置文件保存 `token_sha256`，恒定时间比对），绑定 `user`、`scopes` 与 `allowed_targets`（glob 匹配）。
-- **结构化 JSONL 审计**：每条 `tools/call`（无论放行或拒绝）写入 `ts`, `trace_id`, `user`, `target_id`, `tool`, `args_redacted`, `decision`, `reason`, `exit_code`, `duration_ms`, `truncated`，绝不记录原始 Token。
+- **南向注册认证**：HMAC-SHA256 短效 Enrollment Token，包含 `target_id`、`exp`、`max_mode`、`jti` 与签名；Hub 强制校验签名、有效期、`jti` 吊销列表且拒绝 Agent 声明高于 Token 允许的 `mode`。同 `instance_id` 断线重连可平滑接管；若不同 `instance_id` 抢占在线节点，Hub 写入高危 `agent.register.takeover` 审计告警。
+- **传输灵活性**：Hub 保持纯 HTTP（配合前置 Nginx/Caddy 终结 TLS 或内网高位端口直连），支持通过 `tunnel_listen` / `--tunnel-listen` 将南向 `/agent/ws` 隔离到独立端口；Agent 原生支持 `wss://`（可选 `--ca-cert` 加载内网自签 CA）及 `ws://`（纯 HTTP + 高位端口）。
+- **北向 API 与 Admin 认证**：Bearer Token（配置文件保存 `token_sha256`，恒定时间比对），绑定 `user`、`scopes` 与 `allowed_targets`（glob 匹配），并支持按 `user:target` 令牌桶限流。远程下线/自毁与 Token 吊销仅通过受 `admin` scope 保护的 `/admin/*` HTTP API 及 `revmcp-hub target/token` CLI 提供，不暴露为 MCP Tool 给 LLM。
+- **Agent 文件路径防线**：`fs.read` / `fs.grep` 在拒绝目录、FIFO、Socket 与设备文件之外，默认内置高危凭据路径黑名单（`/etc/shadow`、`/proc/*/environ`、`/root/.ssh/*`、`/home/*/.ssh/*` 等），支持 `--allow-path`、`--deny-path`（含符号链接穿透解析检查）及 `--no-default-deny`。
+- **结构化 JSONL 审计**：每条 `tools/call` 与 Admin 操作（无论放行或拒绝）写入 `ts`, `trace_id`, `user`, `target_id`, `tool`, `args_redacted`, `decision`, `reason`, `exit_code`, `duration_ms`, `truncated`，`trace_id` 透传至 Agent RPC，绝不记录原始 Token。
