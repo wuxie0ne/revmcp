@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/revmcp/revmcp/proto"
 )
@@ -44,6 +45,7 @@ func CollectSysInfo() (*proto.SysInfoResult, error) {
 	}
 
 	res.MemTotalBytes, res.MemAvailBytes = readMemInfo()
+	res.Mounts = readMounts()
 	return res, nil
 }
 
@@ -190,6 +192,93 @@ func readMemInfo() (totalBytes, availBytes uint64) {
 		}
 	}
 	return totalBytes, availBytes
+}
+
+var ignoredFSTypes = map[string]bool{
+	"autofs":      true,
+	"binfmt_misc": true,
+	"bpf":         true,
+	"cgroup":      true,
+	"cgroup2":     true,
+	"configfs":    true,
+	"debugfs":     true,
+	"devpts":      true,
+	"devtmpfs":    true,
+	"fusectl":     true,
+	"hugetlbfs":   true,
+	"mqueue":      true,
+	"nsfs":        true,
+	"proc":        true,
+	"pstore":      true,
+	"rpc_pipefs":  true,
+	"securityfs":  true,
+	"sysfs":       true,
+	"tracefs":     true,
+}
+
+func readMounts() []proto.MountInfo {
+	f, err := os.Open("/proc/mounts")
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = f.Close() }()
+	return parseMounts(f, statFS)
+}
+
+func statFS(mountPoint string) (totalBytes, freeBytes uint64, ok bool) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(mountPoint, &st); err != nil {
+		return 0, 0, false
+	}
+	if st.Bsize <= 0 {
+		return 0, 0, false
+	}
+	bsize := uint64(st.Bsize)
+	return st.Blocks * bsize, st.Bavail * bsize, true
+}
+
+func parseMounts(r *os.File, statFn func(string) (uint64, uint64, bool)) []proto.MountInfo {
+	seen := make(map[string]bool)
+	var mounts []proto.MountInfo
+
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 3 {
+			continue
+		}
+		mountPoint := unescapeMountPath(fields[1])
+		fsType := fields[2]
+		if ignoredFSTypes[fsType] || seen[mountPoint] {
+			continue
+		}
+		seen[mountPoint] = true
+
+		total, free, ok := statFn(mountPoint)
+		if !ok || total == 0 {
+			continue
+		}
+		mounts = append(mounts, proto.MountInfo{
+			MountPoint: mountPoint,
+			FSType:     fsType,
+			TotalBytes: total,
+			FreeBytes:  free,
+		})
+	}
+	sort.Slice(mounts, func(i, j int) bool {
+		return mounts[i].MountPoint < mounts[j].MountPoint
+	})
+	return mounts
+}
+
+func unescapeMountPath(s string) string {
+	r := strings.NewReplacer(
+		`\040`, " ",
+		`\011`, "\t",
+		`\012`, "\n",
+		`\134`, `\`,
+	)
+	return r.Replace(s)
 }
 
 func readProcess(pid int) (proto.ProcessInfo, bool) {

@@ -44,6 +44,7 @@ func main() {
 	var (
 		hubURL       string
 		token        string
+		caCertPath   string
 		targetID     string
 		modeRaw      string
 		ttl          time.Duration
@@ -52,8 +53,9 @@ func main() {
 		tags         = make(tagFlags)
 	)
 
-	flag.StringVar(&hubURL, "hub", "", "Hub WebSocket URL (e.g. wss://mcp.example.com/agent/ws)")
+	flag.StringVar(&hubURL, "hub", "", "Hub WebSocket URL (e.g. wss://mcp.example.com/agent/ws or ws://host:9443/agent/ws)")
 	flag.StringVar(&token, "token", "", "Short-lived enrollment token (or REVMCP_ENROLL_TOKEN env)")
+	flag.StringVar(&caCertPath, "ca-cert", "", "Optional PEM CA certificate path for private/self-signed Hub TLS")
 	flag.StringVar(&targetID, "target-id", "", "Optional target ID (defaults to enrollment token target or hostname)")
 	flag.StringVar(&modeRaw, "mode", string(proto.ModeReadOnly), "Permission mode: readonly | restricted | full")
 	flag.DurationVar(&ttl, "ttl", 0, "Optional auto-exit duration (e.g. 2h)")
@@ -270,9 +272,10 @@ func main() {
 		}
 	}
 
-	client = tunnel.NewClient(tunnel.Config{
-		HubURL: hubURL,
-		Token:  token,
+	client, err = tunnel.NewClient(tunnel.Config{
+		HubURL:     hubURL,
+		Token:      token,
+		CACertPath: caCertPath,
 		AgentInfo: proto.AgentInfo{
 			TargetID:    targetID,
 			InstanceID:  randomHex(8),
@@ -289,6 +292,10 @@ func main() {
 		Handler: handler,
 		Logger:  logger,
 	})
+	if err != nil {
+		logger.Error("tunnel client init failed", "err", err)
+		os.Exit(2)
+	}
 
 	logger.Info("starting revmcp-agent", "version", version, "mode", mode, "ttl", ttl.String())
 	if err := client.Run(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {

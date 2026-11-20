@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"context"
 	"fmt"
 	"path"
 	"slices"
@@ -9,6 +10,22 @@ import (
 	sdkauth "github.com/modelcontextprotocol/go-sdk/auth"
 	hubauth "github.com/revmcp/revmcp/hub/internal/auth"
 )
+
+type traceIDKey struct{}
+
+// WithTraceID attaches a request trace ID to ctx for end-to-end Hub -> Agent correlation.
+func WithTraceID(ctx context.Context, traceID string) context.Context {
+	return context.WithValue(ctx, traceIDKey{}, traceID)
+}
+
+// TraceIDFromContext returns the trace ID stored in ctx, or empty string if absent.
+func TraceIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(traceIDKey{}).(string)
+	return v
+}
 
 const (
 	ScopeRead           = "read"

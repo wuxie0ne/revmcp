@@ -16,6 +16,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/hashicorp/yamux"
 	"github.com/revmcp/revmcp/hub/internal/auth"
+	"github.com/revmcp/revmcp/hub/internal/policy"
 	"github.com/revmcp/revmcp/hub/internal/registry"
 	"github.com/revmcp/revmcp/proto"
 )
@@ -254,9 +255,10 @@ func (c *sessionCaller) Call(ctx context.Context, method string, params any, res
 	}
 
 	req := proto.Request{
-		ID:     newRequestID(),
-		Method: method,
-		Params: rawParams,
+		ID:      newRequestID(),
+		TraceID: policy.TraceIDFromContext(ctx),
+		Method:  method,
+		Params:  rawParams,
 	}
 	if err := proto.WriteFrame(stream, req); err != nil {
 		if ctx.Err() != nil {

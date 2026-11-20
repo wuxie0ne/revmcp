@@ -319,11 +319,12 @@ func (g *Gateway) registerIsolatedTools(srv *mcp.Server, targetID string) {
 
 func (g *Gateway) handleListTargets(_ context.Context, req *mcp.CallToolRequest, in ListTargetsInput) (*mcp.CallToolResult, ListTargetsOutput, error) {
 	start := time.Now()
+	traceID := newTraceID()
 	info := tokenInfo(req)
 	args := map[string]any{"tag": in.Tag}
 
 	if err := policy.Authorize(info, policy.ScopeRead, ""); err != nil {
-		g.auditCall(info, "", "list_targets", args, "deny", err.Error(), nil, time.Since(start), false)
+		g.auditCall(traceID, info, "", "list_targets", args, "deny", err.Error(), nil, time.Since(start), false)
 		return nil, ListTargetsOutput{}, err
 	}
 
@@ -347,7 +348,7 @@ func (g *Gateway) handleListTargets(_ context.Context, req *mcp.CallToolRequest,
 		})
 	}
 
-	g.auditCall(info, "", "list_targets", args, "allow", "", nil, time.Since(start), false)
+	g.auditCall(traceID, info, "", "list_targets", args, "allow", "", nil, time.Since(start), false)
 	return nil, out, nil
 }
 
@@ -397,36 +398,37 @@ func (g *Gateway) execGrepFile(ctx context.Context, req *mcp.CallToolRequest, ta
 
 func (g *Gateway) execCommand(ctx context.Context, req *mcp.CallToolRequest, targetID string, params proto.CmdExecRequest) (*mcp.CallToolResult, any, error) {
 	start := time.Now()
+	traceID := newTraceID()
 	info := tokenInfo(req)
 	args := map[string]any{"command": params.Command, "workdir": params.Workdir, "timeout_sec": params.TimeoutSec}
 
 	if err := policy.Authorize(info, policy.ScopeExecRestricted, targetID); err != nil {
-		g.auditCall(info, targetID, "exec_command", args, "deny", err.Error(), nil, time.Since(start), false)
+		g.auditCall(traceID, info, targetID, "exec_command", args, "deny", err.Error(), nil, time.Since(start), false)
 		return nil, nil, err
 	}
 
 	entry, ok := g.registry.Get(targetID)
 	if !ok {
 		err := fmt.Errorf("target %q is offline", targetID)
-		g.auditCall(info, targetID, "exec_command", args, "deny", err.Error(), nil, time.Since(start), false)
+		g.auditCall(traceID, info, targetID, "exec_command", args, "deny", err.Error(), nil, time.Since(start), false)
 		return nil, nil, err
 	}
 
 	// Defense in depth: if the target runs in full mode and caller lacks exec:full, fail closed.
 	if entry.Info.Mode == proto.ModeFull && !policy.HasScope(info.Scopes, policy.ScopeExecFull) {
 		err := fmt.Errorf("target %q is in full mode; caller requires %q scope", targetID, policy.ScopeExecFull)
-		g.auditCall(info, targetID, "exec_command", args, "deny", err.Error(), nil, time.Since(start), false)
+		g.auditCall(traceID, info, targetID, "exec_command", args, "deny", err.Error(), nil, time.Since(start), false)
 		return nil, nil, err
 	}
 
 	var res proto.CmdExecResult
-	if err := entry.Caller.Call(ctx, proto.MethodCmdExec, params, &res); err != nil {
-		g.auditCall(info, targetID, "exec_command", args, "deny", err.Error(), nil, time.Since(start), false)
+	if err := entry.Caller.Call(policy.WithTraceID(ctx, traceID), proto.MethodCmdExec, params, &res); err != nil {
+		g.auditCall(traceID, info, targetID, "exec_command", args, "deny", err.Error(), nil, time.Since(start), false)
 		return nil, nil, err
 	}
 
 	exitCode := res.ExitCode
-	g.auditCall(info, targetID, "exec_command", args, "allow", "", &exitCode, time.Since(start), res.Truncated)
+	g.auditCall(traceID, info, targetID, "exec_command", args, "allow", "", &exitCode, time.Since(start), res.Truncated)
 	return textResult(targetID, res.ExitCode, res.Truncated, res.Output), nil, nil
 }
 
@@ -454,7 +456,7 @@ func (g *Gateway) execShellSession(ctx context.Context, req *mcp.CallToolRequest
 	default:
 		info := tokenInfo(req)
 		err := fmt.Errorf("invalid shell_session action %q (expected open, run, or close)", action)
-		g.auditCall(info, targetID, "shell_session", args, "deny", err.Error(), nil, 0, false)
+		g.auditCall(newTraceID(), info, targetID, "shell_session", args, "deny", err.Error(), nil, 0, false)
 		return nil, nil, err
 	}
 }
@@ -467,30 +469,32 @@ func (g *Gateway) callAgent(
 	auditArgs map[string]any,
 ) error {
 	start := time.Now()
+	traceID := newTraceID()
 	info := tokenInfo(req)
 
 	if err := policy.Authorize(info, requiredScope, targetID); err != nil {
-		g.auditCall(info, targetID, toolName, auditArgs, "deny", err.Error(), nil, time.Since(start), false)
+		g.auditCall(traceID, info, targetID, toolName, auditArgs, "deny", err.Error(), nil, time.Since(start), false)
 		return err
 	}
 
 	entry, ok := g.registry.Get(targetID)
 	if !ok {
 		err := fmt.Errorf("target %q is offline", targetID)
-		g.auditCall(info, targetID, toolName, auditArgs, "deny", err.Error(), nil, time.Since(start), false)
+		g.auditCall(traceID, info, targetID, toolName, auditArgs, "deny", err.Error(), nil, time.Since(start), false)
 		return err
 	}
 
-	if err := entry.Caller.Call(ctx, rpcMethod, params, resultDst); err != nil {
-		g.auditCall(info, targetID, toolName, auditArgs, "deny", err.Error(), nil, time.Since(start), false)
+	if err := entry.Caller.Call(policy.WithTraceID(ctx, traceID), rpcMethod, params, resultDst); err != nil {
+		g.auditCall(traceID, info, targetID, toolName, auditArgs, "deny", err.Error(), nil, time.Since(start), false)
 		return err
 	}
 
-	g.auditCall(info, targetID, toolName, auditArgs, "allow", "", nil, time.Since(start), false)
+	g.auditCall(traceID, info, targetID, toolName, auditArgs, "allow", "", nil, time.Since(start), false)
 	return nil
 }
 
 func (g *Gateway) auditCall(
+	traceID string,
 	info *sdkauth.TokenInfo,
 	targetID, tool string,
 	args map[string]any,
@@ -507,7 +511,7 @@ func (g *Gateway) auditCall(
 		user = info.UserID
 	}
 	_ = g.audit.Log(policy.AuditEntry{
-		TraceID:      newTraceID(),
+		TraceID:      traceID,
 		User:         user,
 		TargetID:     targetID,
 		Tool:         tool,

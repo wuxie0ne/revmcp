@@ -2,12 +2,15 @@ package tunnel
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -17,35 +20,90 @@ import (
 )
 
 const (
-	wsReadLimitBytes = 4 * 1024 * 1024
-	initialBackoff   = 1 * time.Second
-	maxBackoff       = 30 * time.Second
+	wsReadLimitBytes      = 4 * 1024 * 1024
+	defaultInitialBackoff = 1 * time.Second
+	defaultMaxBackoff     = 30 * time.Second
 )
 
 // Handler dispatches a single inbound RPC request from Hub to the local agent engine.
 type Handler func(ctx context.Context, req proto.Request) (any, *proto.RPCError)
 
-// Config holds outbound WSS/yamux connection parameters for the agent.
+// Config holds outbound WSS/WS + yamux connection parameters for the agent.
 type Config struct {
-	HubURL    string
-	Token     string
-	AgentInfo proto.AgentInfo
-	Handler   Handler
-	Logger    *slog.Logger
+	HubURL         string
+	Token          string
+	CACertPath     string
+	InitialBackoff time.Duration
+	MaxBackoff     time.Duration
+	AgentInfo      proto.AgentInfo
+	Handler        Handler
+	Logger         *slog.Logger
 }
 
 // Client manages the persistent outbound tunnel to Hub with exponential backoff reconnect.
 type Client struct {
 	cfg        Config
+	httpClient *http.Client
 	activeRPCs atomic.Int64
 }
 
-// NewClient creates a new outbound tunnel client.
-func NewClient(cfg Config) *Client {
+// NewClient creates a new outbound tunnel client, optionally loading a custom CA bundle
+// while preserving standard HTTPS_PROXY / HTTP_PROXY environment support.
+func NewClient(cfg Config) (*Client, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &Client{cfg: cfg}
+	if cfg.InitialBackoff <= 0 {
+		cfg.InitialBackoff = defaultInitialBackoff
+	}
+	if cfg.MaxBackoff <= 0 {
+		cfg.MaxBackoff = defaultMaxBackoff
+	}
+
+	httpClient, err := buildHTTPClient(cfg.CACertPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Client{
+		cfg:        cfg,
+		httpClient: httpClient,
+	}, nil
+}
+
+func buildHTTPClient(caCertPath string) (*http.Client, error) {
+	if caCertPath == "" {
+		return nil, nil
+	}
+
+	pemData, err := os.ReadFile(caCertPath)
+	if err != nil {
+		return nil, fmt.Errorf("tunnel: read ca-cert %q: %w", caCertPath, err)
+	}
+
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
+	if !pool.AppendCertsFromPEM(pemData) {
+		return nil, fmt.Errorf("tunnel: no valid PEM certificates found in %q", caCertPath)
+	}
+
+	base, ok := http.DefaultTransport.(*http.Transport)
+	var tr *http.Transport
+	if ok {
+		tr = base.Clone()
+	} else {
+		tr = &http.Transport{Proxy: http.ProxyFromEnvironment}
+	}
+	if tr.TLSClientConfig == nil {
+		tr.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	} else {
+		tr.TLSClientConfig = tr.TLSClientConfig.Clone()
+	}
+	tr.TLSClientConfig.RootCAs = pool
+
+	return &http.Client{Transport: tr}, nil
 }
 
 // ActiveRPCs returns the number of currently executing RPC streams.
@@ -53,18 +111,22 @@ func (c *Client) ActiveRPCs() int {
 	return int(c.activeRPCs.Load())
 }
 
-// Run dials Hub and serves RPC streams until ctx is cancelled.
+// Run dials Hub (ws:// or wss:// on any configured port) and serves RPC streams until ctx is cancelled.
 func (c *Client) Run(ctx context.Context) error {
-	backoff := initialBackoff
+	backoff := c.cfg.InitialBackoff
 
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
-		err := c.connectAndServe(ctx)
+		registered, err := c.connectAndServe(ctx)
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if registered {
+			// Reset backoff after a session successfully registered so transient drops recover quickly.
+			backoff = c.cfg.InitialBackoff
 		}
 
 		c.cfg.Logger.Warn("tunnel disconnected, reconnecting", "err", err, "backoff", backoff)
@@ -77,26 +139,29 @@ func (c *Client) Run(ctx context.Context) error {
 		}
 
 		backoff *= 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
+		if backoff > c.cfg.MaxBackoff {
+			backoff = c.cfg.MaxBackoff
 		}
 	}
 }
 
-func (c *Client) connectAndServe(ctx context.Context) error {
+func (c *Client) connectAndServe(ctx context.Context) (bool, error) {
 	dialCtx, dialCancel := context.WithTimeout(ctx, 15*time.Second)
 	defer dialCancel()
 
-	wsConn, resp, err := websocket.Dial(dialCtx, c.cfg.HubURL, &websocket.DialOptions{
+	dialOpts := &websocket.DialOptions{
+		HTTPClient: c.httpClient,
 		HTTPHeader: http.Header{
 			"Authorization": []string{"Bearer " + c.cfg.Token},
 		},
-	})
+	}
+
+	wsConn, resp, err := websocket.Dial(dialCtx, c.cfg.HubURL, dialOpts)
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}
 	if err != nil {
-		return fmt.Errorf("tunnel: websocket dial: %w", err)
+		return false, fmt.Errorf("tunnel: websocket dial: %w", err)
 	}
 
 	// Critical rule: raise ReadLimit from default 32KB to 4MB before wrapping in NetConn.
@@ -120,12 +185,12 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 
 	session, err := yamux.Client(netConn, yCfg)
 	if err != nil {
-		return fmt.Errorf("tunnel: yamux client init: %w", err)
+		return false, fmt.Errorf("tunnel: yamux client init: %w", err)
 	}
 	defer func() { _ = session.Close() }()
 
 	if err := c.register(session); err != nil {
-		return fmt.Errorf("tunnel: register: %w", err)
+		return false, fmt.Errorf("tunnel: register: %w", err)
 	}
 	c.cfg.Logger.Info("agent registered with hub", "target_id", c.cfg.AgentInfo.TargetID, "mode", c.cfg.AgentInfo.Mode)
 
@@ -140,9 +205,9 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 		stream, err := session.AcceptStream()
 		if err != nil {
 			if errors.Is(err, io.EOF) || ctx.Err() != nil {
-				return err
+				return true, err
 			}
-			return fmt.Errorf("tunnel: accept stream: %w", err)
+			return true, fmt.Errorf("tunnel: accept stream: %w", err)
 		}
 		go c.handleStream(ctx, stream)
 	}
@@ -213,6 +278,8 @@ func (c *Client) handleStream(parentCtx context.Context, stream *yamux.Stream) {
 			cancel()
 		}
 	}()
+
+	c.cfg.Logger.Debug("dispatching rpc", "method", req.Method, "req_id", req.ID, "trace_id", req.TraceID)
 
 	result, rpcErr := c.cfg.Handler(rpcCtx, req)
 	resp := proto.Response{
