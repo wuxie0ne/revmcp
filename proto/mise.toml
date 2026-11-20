@@ -1,0 +1,6 @@
+[env]
+GOTOOLCHAIN = "local"
+GOWORK = "off"
+
+[tools]
+go = "1.23.12"

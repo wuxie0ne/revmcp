@@ -1,0 +1,39 @@
+listen: "127.0.0.1:8443"
+
+# Optional dedicated listen address/port for southbound Agent tunnels (/agent/ws).
+# Leave empty to share the `listen` address above (e.g. behind a single Nginx reverse proxy).
+# Set a separate address (e.g. "0.0.0.0:9443") to isolate tunnel traffic on a custom port.
+tunnel_listen: ""
+
+# Secret used to sign and verify HMAC-SHA256 agent enrollment tokens.
+# Supports ${ENV_VAR} expansion.
+agent_signing_secret: "${REVMCP_SIGNING_SECRET}"
+
+# Path to JSONL audit log file (set to "-" for stderr).
+audit_log_path: "/var/log/revmcp/audit.jsonl"
+
+# Optional maximum concurrent RPC calls per agent (0 = default 16).
+max_inflight_per_agent: 16
+
+# Northbound MCP clients authenticated via Authorization: Bearer <token>.
+# Generate sha256 hex digest with: printf '%s' '<your-secret-token>' | sha256sum
+clients:
+  - name: "ops-alice"
+    token_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    scopes:
+      - "read"
+      - "exec:restricted"
+    allowed_targets:
+      - "prod-*"
+      - "staging-*"
+
+  - name: "sre-emergency"
+    token_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    scopes:
+      - "read"
+      - "exec:restricted"
+      - "exec:full"
+      - "exec:session"
+      - "admin"
+    allowed_targets:
+      - "*"

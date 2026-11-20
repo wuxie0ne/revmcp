@@ -1,0 +1,20 @@
+# Build artifacts
+/bin/
+*.exe
+*.out
+*.test
+coverage.txt
+
+# Local runtime & secrets
+*.local.yaml
+*.local.yml
+audit.jsonl
+.env
+.env.*
+
+# Editor & OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

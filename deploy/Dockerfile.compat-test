@@ -1,0 +1,18 @@
+# Multi-stage compatibility test verifying revmcp-agent runs cleanly as a static
+# binary on both Alpine (musl / minimal) and CentOS 7 (glibc 2.17).
+#
+# Usage:
+#   make build-agent-linux-amd64
+#   docker build -f deploy/Dockerfile.compat-test --target alpine-check .
+#   docker build -f deploy/Dockerfile.compat-test --target centos7-check .
+
+FROM alpine:3.20 AS alpine-check
+COPY bin/revmcp-agent-linux-amd64 /usr/local/bin/revmcp-agent
+RUN chmod +x /usr/local/bin/revmcp-agent \
+    && /usr/local/bin/revmcp-agent --version
+
+FROM centos:7 AS centos7-check
+COPY bin/revmcp-agent-linux-amd64 /usr/local/bin/revmcp-agent
+RUN chmod +x /usr/local/bin/revmcp-agent \
+    && (ldd /usr/local/bin/revmcp-agent 2>&1 | grep -E "not a dynamic executable|statically linked") \
+    && /usr/local/bin/revmcp-agent --version
