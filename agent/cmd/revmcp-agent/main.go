@@ -255,7 +255,11 @@ func main() {
 			}
 			res, err := sessions.Open(rpcCtx, p)
 			if err != nil {
-				return nil, &proto.RPCError{Code: proto.ErrCodeUnsupported, Message: err.Error()}
+				code := proto.ErrCodeInternal
+				if errors.Is(err, executor.ErrMaxSessionsReached) {
+					code = proto.ErrCodePolicyDenied
+				}
+				return nil, &proto.RPCError{Code: code, Message: err.Error()}
 			}
 			return res, nil
 
@@ -266,7 +270,11 @@ func main() {
 			}
 			res, err := sessions.Exec(rpcCtx, p)
 			if err != nil {
-				return nil, &proto.RPCError{Code: proto.ErrCodeUnsupported, Message: err.Error()}
+				code := proto.ErrCodeInternal
+				if errors.Is(err, executor.ErrSessionNotFound) {
+					code = proto.ErrCodeNotFound
+				}
+				return nil, &proto.RPCError{Code: code, Message: err.Error()}
 			}
 			return res, nil
 
@@ -277,7 +285,11 @@ func main() {
 			}
 			res, err := sessions.Close(rpcCtx, p)
 			if err != nil {
-				return nil, &proto.RPCError{Code: proto.ErrCodeUnsupported, Message: err.Error()}
+				code := proto.ErrCodeInternal
+				if errors.Is(err, executor.ErrSessionNotFound) {
+					code = proto.ErrCodeNotFound
+				}
+				return nil, &proto.RPCError{Code: code, Message: err.Error()}
 			}
 			return res, nil
 
