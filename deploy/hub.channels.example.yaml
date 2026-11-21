@@ -6,7 +6,7 @@ audit_log_path: "-"
 management:
   # Read by the management CLI. Use the Hub's management URL.
   hub_url: "http://127.0.0.1:8443"
-  admin_client: "token-admin"
+  admin_token_sha256: "${REVMCP_ADMIN_TOKEN_SHA256}"
 
 tokens:
   mcp_signing_secret: "${REVMCP_MCP_SIGNING_SECRET}"
@@ -23,9 +23,3 @@ tokens:
     fleet:
       target: "open-*"
       agent_ttl: "30m"
-
-clients:
-  - name: "token-admin"
-    token_sha256: "${REVMCP_ADMIN_TOKEN_SHA256}"
-    scopes: ["admin"]
-    allowed_targets: ["*"]

@@ -11,7 +11,7 @@
 - **渠道凭证管理**：按单机或通配目标一次签发两枚凭证，支持查看在线目标、重显有效凭证、轮换和吊销。
 - **一拖多路由与单机隔离**：支持 `/mcp` 聚合跨机排查，以及 `/mcp/{target_id}` 单机隔离（自动隐藏 `target_id` 参数，防止 AI 误操作其他主机）。
 - **纵深安全防御**：
-  - 北向签名渠道 Bearer 或旧版静态 Bearer，按 Scope 和目标规则授权，并支持令牌桶限流；
+  - 北向签名渠道 Bearer，按 Scope 和目标规则授权，并支持令牌桶限流；
   - 南向 HMAC-SHA256 短效注册 Token，渠道内拒绝同名在线连接，按渠道和凭证类型吊销；
   - Agent 启动级硬锁 `--mode readonly|restricted|full`（`restricted` 使用 `mvdan.cc/sh/v3` AST 白名单解析，非正则黑名单）；
   - 文件读取拒绝设备/管道文件（防 `/dev/zero` 阻塞），默认内置高危凭据路径黑名单，并支持 `--allow-path` / `--deny-path`（含符号链接穿透检测）；
@@ -53,93 +53,7 @@ docker build -f deploy/Dockerfile.compat-test --target alpine-check .
 docker build -f deploy/Dockerfile.compat-test --target centos7-check .
 ```
 
-### 3. 配置并启动 Hub（旧版静态凭证）
-
-新部署可直接使用[渠道凭证管理](#渠道凭证管理)。以下步骤适用于旧版静态客户端和离线签发。
-
-先为北向 AI 客户端或管理员生成高熵 Bearer Token 的 SHA-256 摘要，并填入配置文件（参考 [deploy/hub.example.yaml](deploy/hub.example.yaml)）：
-
-```bash
-printf '%s' 'replace-with-your-client-bearer-token' | sha256sum
-```
-
-签发南向短效节点注册 Token 并启动 Hub：
-
-```bash
-export REVMCP_SIGNING_SECRET="replace-with-strong-random-secret"
-
-# 为目标机签发 2 小时有效的 readonly 注册 Token
-ENROLL_TOKEN=$(./bin/revmcp-hub token gen \
-  --secret "$REVMCP_SIGNING_SECRET" \
-  --target prod-web-01 \
-  --mode readonly \
-  --ttl 2h)
-
-# 方式 A：单端口模式（配合前置 Nginx 443 统一反代 /mcp 与 /agent/ws）
-./bin/revmcp-hub serve --config deploy/hub.example.yaml
-
-# 方式 B：南北向分端口隔离（/mcp 在 listen，/agent/ws 独立监听在自定义高位端口）
-./bin/revmcp-hub serve \
-  --config deploy/hub.example.yaml \
-  --listen 127.0.0.1:8443 \
-  --tunnel-listen 0.0.0.0:9443
-```
-
-> 生产环境可参考 [deploy/nginx.example.conf](deploy/nginx.example.conf) 配置前置 TLS 终结与反代。
-
-### 4. 在目标机运行 Agent
-
-将单文件二进制 `bin/revmcp-agent-linux-amd64`（或 `arm64`）拷贝至目标机直接运行：
-
-```bash
-# 走 HTTPS/WSS（公网或内网反代，支持 HTTPS_PROXY；内网自签证书可加 --ca-cert）
-./revmcp-agent-linux-amd64 \
-  --hub wss://mcp.example.com:9443/agent/ws \
-  --ca-cert /path/to/private-ca.pem \
-  --token "$ENROLL_TOKEN" \
-  --mode readonly \
-  --allow-path '/var/log/*' \
-  --tag env=prod \
-  --ttl 2h \
-  --self-destruct-on-exit
-
-# 或内网直连纯 HTTP 高位端口（ws://）
-./revmcp-agent-linux-amd64 \
-  --hub ws://10.0.0.10:9443/agent/ws \
-  --token "$ENROLL_TOKEN" \
-  --mode readonly \
-  --ttl 1h
-```
-
-> 默认内置高危路径黑名单（`/etc/shadow`、`/proc/*/environ`、`/root/.ssh/*`、`/home/*/.ssh/*`、`/etc/kubernetes/pki/*` 等）；仅在明确需要时可通过 `--no-default-deny` 关闭。
-
-### 5. 本地 AI 客户端接入（MCP Streamable HTTP）
-
-在 Cursor / Claude Code / Claude Desktop 的 MCP 配置中添加远程 HTTP 服务（Hub 以 `Stateless: true` 模式运行，仅需标准 `POST` 请求）：
-
-```json
-{
-  "mcpServers": {
-    "revmcp-all": {
-      "url": "https://mcp.example.com/mcp",
-      "headers": {
-        "Authorization": "Bearer <your-client-bearer-token>"
-      }
-    },
-    "revmcp-prod-web-01": {
-      "url": "https://mcp.example.com/mcp/prod-web-01",
-      "headers": {
-        "Authorization": "Bearer <your-client-bearer-token>"
-      }
-    }
-  }
-}
-```
-
-- `/mcp`：聚合端点，可调用 `list_targets` 并在多台授权目标机间切换联调。
-- `/mcp/{target_id}`：单机隔离端点，工具 Schema 自动隐藏 `target_id`，严格锁定单一目标机。
-
-### 渠道凭证管理
+### 3. 配置 Hub 并签发渠道凭证
 
 渠道将 Agent 注册 Token 与 AI 客户端的 MCP Bearer 绑定到同一目标规则。复制[渠道配置模板](deploy/hub.channels.example.yaml)，在 Hub 和管理终端加载对应的凭证。
 
@@ -155,15 +69,15 @@ export REVMCP_ADMIN_TOKEN_SHA256="$(
 )"
 ```
 
-Hub 启动时读取两把签名密钥和管理员 Bearer 摘要。管理终端读取管理员 Bearer 原值 `REVMCP_ADMIN_TOKEN`，并从同一配置的 `management.hub_url` 取得 Hub 地址。重启时加载已保存的值。状态文件路径相对于 YAML 所在目录，由一个 Hub 进程持有，启动前需准备可写的父目录。
+Hub 启动时读取两把签名密钥和 `management.admin_token_sha256` 指定的管理员 Bearer 摘要。管理终端读取管理员 Bearer 原值 `REVMCP_ADMIN_TOKEN`，并从同一配置的 `management.hub_url` 取得 Hub 地址。重启时加载已保存的值。状态文件路径相对于 YAML 所在目录，由一个 Hub 进程持有，启动前需准备可写的父目录。
 
-模板默认在 `127.0.0.1:8443` 上启动。跨机器接入时，把 Agent 和 MCP 客户端指向它们可达的地址，例如 TLS 反代的 `wss://hub.example.com/agent/ws` 和 `https://hub.example.com/mcp`。管理命令可以在 Hub 主机上使用回环地址。
+模板默认在 `127.0.0.1:8443` 上启动，MCP 和 Agent 隧道共用监听端口。需要独立的 Agent 隧道端口时，在模板里设置 `tunnel_listen`，例如 `"0.0.0.0:9443"`。跨机器接入可通过 TLS 反代。管理命令可以在 Hub 主机上使用回环地址。参见 [Nginx 反代模板](deploy/nginx.example.conf)。
 
 ```bash
 # 启动 Hub
 ./bin/revmcp-hub serve --config hub.channels.local.yaml
 
-# 在管理终端按预设策略签发
+# 另开一个已加载管理员凭证的终端，按预设策略签发
 ./bin/revmcp-hub token issue --config hub.channels.local.yaml --name channel-01 --profile single
 ./bin/revmcp-hub token issue --config hub.channels.local.yaml --name channel-02 --profile fleet
 
@@ -172,17 +86,65 @@ Hub 启动时读取两把签名密钥和管理员 Bearer 摘要。管理终端�
   --name mcp-remote-99 --scope read --allowed-target remote-99 --ttl 24h
 ```
 
-`--ttl` 控制 MCP Bearer，`--agent-ttl` 控制 Agent 注册 Token，`--mode` 控制 Agent 的最高运行模式。签发后，目标机使用输出的 `enrollment_token`。本机联调示例如下。
+`--ttl` 控制 MCP Bearer 的有效期，`--agent-ttl` 控制 Agent 注册 Token 的有效期，`--mode` 控制 Agent 的最高运行模式。
+
+### 4. 在目标机运行 Agent
+
+将单文件二进制 `bin/revmcp-agent-linux-amd64`（或 `arm64`）拷贝至目标机。下面以 `single` 预设的 `remote-99` 为例，使用签发结果里的 `enrollment_token`。
 
 ```bash
-env REVMCP_ENROLL_TOKEN='<channel-01 的 enrollment_token>' \
-  ./revmcp-agent-linux-arm64 --hub ws://127.0.0.1:8443/agent/ws \
-  --target-id remote-99 --mode readonly
+export REVMCP_ENROLL_TOKEN='<channel-01 的 enrollment_token>'
+
+# 走 HTTPS/WSS（公网或内网反代，支持 HTTPS_PROXY；内网自签证书可加 --ca-cert）
+./revmcp-agent-linux-amd64 \
+  --hub wss://mcp.example.com:9443/agent/ws \
+  --ca-cert /path/to/private-ca.pem \
+  --target-id remote-99 \
+  --mode readonly \
+  --allow-path '/var/log/*' \
+  --tag env=prod \
+  --ttl 2h \
+  --self-destruct-on-exit
+
+# 或在 Hub 主机上用模板的默认端口联调
+./revmcp-agent-linux-amd64 \
+  --hub ws://127.0.0.1:8443/agent/ws \
+  --target-id remote-99 \
+  --mode readonly \
+  --ttl 1h
 ```
+
+> 默认内置高危路径黑名单（`/etc/shadow`、`/proc/*/environ`、`/root/.ssh/*`、`/home/*/.ssh/*`、`/etc/kubernetes/pki/*` 等）；仅在明确需要时可通过 `--no-default-deny` 关闭。
 
 使用 `fleet` 时，可以在两台目标机上用 `channel-02` 的注册 Token，分别指定 `--target-id open-1` 和 `--target-id open-2`。Hub 直接拒绝同渠道的同名在线连接。网络闪断后，Agent 会在旧连接被 Hub 的 keepalive 清理后按退避策略重连。不同渠道可以各有一个 `open-1`。通配符注册 Token 的持有者可以声明本渠道内任意匹配的空闲名称。
 
-本机联调时，AI 客户端连接 `http://127.0.0.1:8443/mcp`，请求头使用 `Authorization: Bearer <对应渠道的 mcp_bearer>`。用 `list_targets` 查看本渠道在线节点。单节点入口 `/mcp/remote-99` 也按 Bearer 所属渠道路由。
+### 5. 本地 AI 客户端接入（MCP Streamable HTTP）
+
+在客户端的 MCP 配置中添加远程 HTTP 服务，请求头使用对应渠道签发的 `mcp_bearer`。Hub 使用无状态 Streamable HTTP，支持标准 `POST` 请求。在 Hub 主机上联调时可使用 `http://127.0.0.1:8443/mcp`。
+
+```json
+{
+  "mcpServers": {
+    "revmcp-all": {
+      "url": "https://mcp.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer <channel-01 的 mcp_bearer>"
+      }
+    },
+    "revmcp-remote-99": {
+      "url": "https://mcp.example.com/mcp/remote-99",
+      "headers": {
+        "Authorization": "Bearer <channel-01 的 mcp_bearer>"
+      }
+    }
+  }
+}
+```
+
+- `/mcp`：聚合端点，可调用 `list_targets` 并在多台授权目标机间切换联调。
+- `/mcp/{target_id}`：单机隔离端点，工具 Schema 自动隐藏 `target_id`，严格锁定单一目标机。
+
+## 渠道凭证管理
 
 ```bash
 # 每个渠道一行，显示目标规则、Agent 最高模式、注册凭证到期时间和在线目标
@@ -196,40 +158,17 @@ env REVMCP_ENROLL_TOKEN='<channel-01 的 enrollment_token>' \
 ./bin/revmcp-hub token revoke --config hub.channels.local.yaml --channel channel-01 --kind agent
 # 对单个在线节点请求退出
 ./bin/revmcp-hub target kick --config hub.channels.local.yaml --channel channel-02 --target open-1
+# 请求所有使用已过期注册凭证接入的在线 Agent 退出
+./bin/revmcp-hub target kick --config hub.channels.local.yaml --expired
+# 退出时同时删除该节点上的 Agent 二进制
+./bin/revmcp-hub target kick --config hub.channels.local.yaml --channel channel-02 --target open-1 --self-destruct
 # 删除渠道、吊销两类凭证并断开该渠道全部连接，随后可用原名重建
 ./bin/revmcp-hub channel delete --config hub.channels.local.yaml --name channel-02
 ```
 
 Hub 可从签发元数据和签名密钥重现原凭证。列表默认隐藏原值，`--show-secrets` 只返回仍有效的凭证。Hub 发现签名密钥与状态文件不一致时会拒绝启动。确认换钥时，用新密钥和 `serve --config hub.channels.local.yaml --accept-signing-key-change` 启动一次，永久吊销受影响的渠道凭证，再通过 `token rotate` 签发对应类型的新凭证。单独吊销 Agent 注册 Token 会阻止下次连接；已建立的连接继续在线。
 
-#### 从静态凭证迁移
-
-1. 在现有 Hub 配置中加入模板的 `management`、`tokens` 和指定的管理员记录，同时保留迁移期所需的静态客户端，然后用新 Hub 二进制重启。
-2. 为每个目标或目标组签发渠道凭证。用新 Agent 二进制和渠道的 `enrollment_token` 启动目标机，并显式设置 `--target-id`。
-3. 将 AI 客户端换成对应渠道的 `mcp_bearer`。原有 MCP 地址可以继续使用。用 `list_targets` 和一次只读工具调用验证路由，再清理不再需要的静态客户端记录。
-
-迁移期间，旧静态 Bearer 访问旧 Agent 的目标空间，渠道 Bearer 访问自身渠道。删除渠道会断开该渠道的在线目标并吊销两枚凭证。同名重建会分配新的渠道 ID，旧凭证无法用于新渠道。
-
-### 6. 旧版管理员运维操作
-
-需使用具备 `admin` scope 的 Bearer Token 调用 Admin API 或 CLI：
-
-```bash
-export REVMCP_ADMIN_TOKEN="<admin-bearer-token>"
-
-# 查看在线节点列表（支持 --tag env=prod 过滤）
-./bin/revmcp-hub target list --hub http://127.0.0.1:8443
-
-# 远程下线目标机并触发磁盘二进制自毁
-./bin/revmcp-hub target kick \
-  --hub http://127.0.0.1:8443 \
-  --target prod-web-01 \
-  --reason "排查完成清理" \
-  --self-destruct
-
-# 吊销疑似泄露的南向注册 Token（按签发时输出的 jti）
-./bin/revmcp-hub token revoke --hub http://127.0.0.1:8443 --jti <jti>
-```
+`target kick --expired` 扫描所有渠道，按各连接注册时使用的凭证到期时间筛选。轮换凭证后，旧连接仍按原到期时间判断。命令返回逐目标结果，任一 Agent 未接受退出请求时返回非零退出码。
 
 ## 内置 MCP Tool 与权限矩阵
 

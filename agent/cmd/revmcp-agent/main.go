@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -72,7 +70,7 @@ func main() {
 	flag.StringVar(&hubURL, "hub", "", "Hub WebSocket URL (e.g. wss://mcp.example.com/agent/ws or ws://host:9443/agent/ws)")
 	flag.StringVar(&token, "token", "", "Short-lived enrollment token (or REVMCP_ENROLL_TOKEN env)")
 	flag.StringVar(&caCertPath, "ca-cert", "", "Optional PEM CA certificate path for private/self-signed Hub TLS")
-	flag.StringVar(&targetID, "target-id", "", "Target ID (required for channel credentials)")
+	flag.StringVar(&targetID, "target-id", "", "Required channel target ID")
 	flag.StringVar(&modeRaw, "mode", string(proto.ModeReadOnly), "Permission mode: readonly | restricted | full")
 	flag.DurationVar(&ttl, "ttl", 0, "Optional auto-exit duration (e.g. 2h)")
 	flag.BoolVar(&selfDestruct, "self-destruct-on-exit", false, "Remove agent binary from disk upon exit")
@@ -93,8 +91,8 @@ func main() {
 	if token == "" {
 		token = os.Getenv("REVMCP_ENROLL_TOKEN")
 	}
-	if hubURL == "" || token == "" {
-		logger.Error("missing required flags: --hub and --token are required")
+	if hubURL == "" || token == "" || strings.TrimSpace(targetID) == "" {
+		logger.Error("Hub URL, enrollment token, and --target-id are required")
 		os.Exit(2)
 	}
 
@@ -129,11 +127,6 @@ func main() {
 		kernel = sys.Kernel
 		inContainer = sys.InContainer
 	}
-	targetIDExplicit := targetID != ""
-	if !targetIDExplicit {
-		targetID = hostname
-	}
-
 	execEngine := executor.New()
 	sessions := executor.NewSessionPool(executor.SessionConfig{})
 	defer sessions.CloseAll()
@@ -315,13 +308,11 @@ func main() {
 	}
 
 	client, err = tunnel.NewClient(tunnel.Config{
-		HubURL:           hubURL,
-		Token:            token,
-		CACertPath:       caCertPath,
-		TargetIDExplicit: targetIDExplicit,
+		HubURL:     hubURL,
+		Token:      token,
+		CACertPath: caCertPath,
 		AgentInfo: proto.AgentInfo{
 			TargetID:    targetID,
-			InstanceID:  randomHex(8),
 			Hostname:    hostname,
 			OS:          runtime.GOOS,
 			Kernel:      kernel,
@@ -352,14 +343,6 @@ func main() {
 			logger.Info("self-destruct completed")
 		}
 	}
-}
-
-func randomHex(nBytes int) string {
-	b := make([]byte, nBytes)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano())
-	}
-	return hex.EncodeToString(b)
 }
 
 func removeSelfBinary() error {

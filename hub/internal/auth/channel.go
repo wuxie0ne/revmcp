@@ -19,12 +19,9 @@ func ChannelID(info *sdkauth.TokenInfo) string {
 	return id
 }
 
-// WithChannelBearer preserves legacy static authentication in its own target namespace.
-func WithChannelBearer(store *channel.Store, static sdkauth.TokenVerifier) sdkauth.TokenVerifier {
-	return func(ctx context.Context, token string, req *http.Request) (*sdkauth.TokenInfo, error) {
-		if !channel.Managed(token) {
-			return static(ctx, token, req)
-		}
+// NewChannelBearerVerifier accepts only current MCP channel credentials.
+func NewChannelBearerVerifier(store *channel.Store) sdkauth.TokenVerifier {
+	return func(_ context.Context, token string, _ *http.Request) (*sdkauth.TokenInfo, error) {
 		record, expiry, err := store.Verify(token, channel.MCP)
 		if err != nil {
 			return nil, sdkauth.ErrInvalidToken

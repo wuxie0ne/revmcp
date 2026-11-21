@@ -10,7 +10,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
@@ -26,7 +25,6 @@ import (
 	"github.com/revmcp/revmcp/hub/internal/policy"
 	"github.com/revmcp/revmcp/hub/internal/registry"
 	"github.com/revmcp/revmcp/hub/internal/tunnel"
-	"github.com/revmcp/revmcp/proto"
 )
 
 var version = "dev"
@@ -69,15 +67,12 @@ func main() {
 func printUsage() {
 	_, _ = fmt.Fprintln(os.Stderr, "Usage:")
 	_, _ = fmt.Fprintln(os.Stderr, "  revmcp-hub serve --config <path> [--listen <addr>] [--tunnel-listen <addr>] [--accept-signing-key-change]")
-	_, _ = fmt.Fprintln(os.Stderr, "  revmcp-hub token gen --target <id> [--mode readonly|restricted|full] [--ttl 2h] [--secret <secret> | --config <path>]")
 	_, _ = fmt.Fprintln(os.Stderr, "  revmcp-hub token issue --config <path> --name <channel> [--profile <profile> | --allowed-target <rule>] [--scope <scope>] [--mode <mode>] [--agent-ttl <duration>] [--ttl <duration>]")
 	_, _ = fmt.Fprintln(os.Stderr, "  revmcp-hub token list --config <path> [--channel <name> [--details | --show-secrets]]")
 	_, _ = fmt.Fprintln(os.Stderr, "  revmcp-hub token rotate | revoke --config <path> --channel <name> --kind agent|mcp")
 	_, _ = fmt.Fprintln(os.Stderr, "  revmcp-hub channel delete --config <path> --name <channel>")
-	_, _ = fmt.Fprintln(os.Stderr, "  revmcp-hub target kick --config <path> --channel <name> --target <id>")
-	_, _ = fmt.Fprintln(os.Stderr, "  revmcp-hub token revoke --hub <url> --token <admin-bearer> --jti <jti>")
-	_, _ = fmt.Fprintln(os.Stderr, "  revmcp-hub target list --hub <url> --token <admin-bearer> [--tag k=v]")
-	_, _ = fmt.Fprintln(os.Stderr, "  revmcp-hub target kick --hub <url> --token <admin-bearer> --target <id> [--reason <msg>] [--self-destruct]")
+	_, _ = fmt.Fprintln(os.Stderr, "  revmcp-hub target kick --config <path> --channel <name> --target <id> [--reason <msg>] [--self-destruct]")
+	_, _ = fmt.Fprintln(os.Stderr, "  revmcp-hub target kick --config <path> --expired [--reason <msg>]")
 	_, _ = fmt.Fprintln(os.Stderr, "  revmcp-hub version")
 }
 
@@ -104,26 +99,20 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	if acceptKeyChange && cfg.Tokens == nil {
-		return errors.New("--accept-signing-key-change requires channels to be configured")
-	}
 	if listenFlag != "" {
 		cfg.Listen = listenFlag
 	}
 	if tunnelListenFlag != "" {
 		cfg.TunnelListen = tunnelListenFlag
 	}
-
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	signer, err := hubauth.NewEnrollmentSigner(cfg.AgentSigningSecret)
+	store, err := channel.Open(cfg.Tokens.StatePath, cfg.AgentSigningSecret, cfg.Tokens.SigningSecret, acceptKeyChange)
 	if err != nil {
 		return err
 	}
-	for _, jti := range cfg.RevokedJTIs {
-		signer.Revoke(jti)
-	}
-	verifier, err := hubauth.NewStaticBearerVerifier(cfg.Clients)
+	defer func() { _ = store.Close() }()
+	adminVerifier, err := hubauth.NewAdminBearerVerifier(cfg.Management.AdminTokenSHA256)
 	if err != nil {
 		return err
 	}
@@ -134,12 +123,12 @@ func runServe(args []string) error {
 	defer func() { _ = audit.Close() }()
 
 	reg := registry.New()
-	tunnelSrv := tunnel.NewServer(signer, reg, audit, version, cfg.MaxInflightPerAgent, logger)
+	tunnelSrv := tunnel.NewServer(store, reg, audit, version, cfg.MaxInflightPerAgent, logger)
 	mcpGW := mcpserver.NewGateway(version, reg, audit)
 	if rl := policy.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst); rl != nil {
 		mcpGW.SetRateLimiter(rl)
 	}
-	adminHandler := admin.NewHandler(reg, signer, audit)
+	adminHandler := admin.NewHandler(reg, store, audit)
 
 	healthHandler := func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -149,19 +138,8 @@ func runServe(args []string) error {
 	splitTunnel := cfg.TunnelListen != "" && cfg.TunnelListen != cfg.Listen
 
 	mainMux := http.NewServeMux()
-	mcpVerifier := verifier
-	if cfg.Tokens != nil {
-		store, err := channel.Open(cfg.Tokens.StatePath, cfg.AgentSigningSecret, cfg.Tokens.SigningSecret, acceptKeyChange)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = store.Close() }()
-		tunnelSrv.UseChannels(store)
-		mcpVerifier = hubauth.WithChannelBearer(store, verifier)
-		adminHandler.RegisterChannelRoutes(mainMux, verifier, cfg, store)
-	}
-	mcpGW.RegisterRoutes(mainMux, mcpVerifier)
-	adminHandler.RegisterRoutes(mainMux, verifier)
+	mcpGW.RegisterRoutes(mainMux, hubauth.NewChannelBearerVerifier(store))
+	adminHandler.RegisterRoutes(mainMux, adminVerifier, cfg.Tokens)
 	mainMux.HandleFunc("/healthz", healthHandler)
 	if !splitTunnel {
 		mainMux.Handle("/agent/ws", tunnelSrv)
@@ -225,200 +203,20 @@ func runServe(args []string) error {
 
 func runToken(args []string) error {
 	if len(args) < 1 {
-		return errors.New("expected subcommand: token issue | list | rotate | revoke | gen")
+		return errors.New("expected subcommand: token issue | list | rotate | revoke")
 	}
 
 	switch args[0] {
-	case "gen":
-		return runTokenGen(args[1:], os.Stdout)
 	case "issue":
 		return runTokenIssue(args[1:])
 	case "list":
 		return runTokenList(args[1:])
 	case "rotate":
-		return runTokenRotate(args[1:])
+		return runTokenChange(args[1:], "rotate")
 	case "revoke":
-		return runTokenRevoke(args[1:])
+		return runTokenChange(args[1:], "revoke")
 	default:
-		return fmt.Errorf("unknown token subcommand %q (expected gen or revoke)", args[0])
-	}
-}
-
-func runTokenGen(args []string, stdout io.Writer) error {
-	fs := flag.NewFlagSet("token gen", flag.ExitOnError)
-	var (
-		configPath string
-		secret     string
-		targetID   string
-		modeRaw    string
-		ttl        time.Duration
-	)
-	fs.StringVar(&configPath, "config", "", "Path to hub YAML configuration file (reads agent_signing_secret)")
-	fs.StringVar(&secret, "secret", "", "Signing secret (falls back to REVMCP_SIGNING_SECRET env)")
-	fs.StringVar(&targetID, "target", "", "Target ID to bind into the enrollment token")
-	fs.StringVar(&modeRaw, "mode", string(proto.ModeReadOnly), "Maximum allowed mode: readonly | restricted | full")
-	fs.DurationVar(&ttl, "ttl", 2*time.Hour, "Enrollment token validity duration")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	if secret == "" && configPath != "" {
-		cfg, err := config.Load(configPath)
-		if err != nil {
-			return err
-		}
-		secret = cfg.AgentSigningSecret
-	}
-	if secret == "" {
-		secret = os.Getenv("REVMCP_SIGNING_SECRET")
-	}
-
-	signer, err := hubauth.NewEnrollmentSigner(secret)
-	if err != nil {
-		return err
-	}
-	mode, err := proto.ParseMode(modeRaw)
-	if err != nil {
-		return err
-	}
-
-	tok, claims, err := signer.Issue(targetID, mode, ttl)
-	if err != nil {
-		return err
-	}
-
-	if _, err := fmt.Fprintln(stdout, tok); err != nil {
-		return err
-	}
-	_, _ = fmt.Fprintf(os.Stderr, "issued enrollment token target=%s max_mode=%s jti=%s exp=%s\n",
-		claims.TargetID, claims.MaxMode, claims.JTI, time.Unix(claims.Exp, 0).UTC().Format(time.RFC3339))
-	return nil
-}
-
-func runTokenRevoke(args []string) error {
-	fs := flag.NewFlagSet("token revoke", flag.ExitOnError)
-	var (
-		hubURL                        string
-		token                         string
-		jti                           string
-		configPath, channelName, kind string
-	)
-	fs.StringVar(&hubURL, "hub", "http://127.0.0.1:8443", "Hub base HTTP URL")
-	fs.StringVar(&token, "token", "", "Admin Bearer token (or REVMCP_ADMIN_TOKEN env)")
-	fs.StringVar(&jti, "jti", "", "Legacy enrollment token JTI to revoke")
-	fs.StringVar(&configPath, "config", "", "Hub management configuration")
-	fs.StringVar(&channelName, "channel", "", "Channel name")
-	fs.StringVar(&kind, "kind", "", "Credential kind (agent or mcp)")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if channelName != "" || kind != "" || configPath != "" {
-		if jti != "" {
-			return errors.New("channel revocation is selected by --channel and --kind")
-		}
-		return changeChannelCredential(configPath, channelName, kind, "revoke")
-	}
-	if token == "" {
-		token = os.Getenv("REVMCP_ADMIN_TOKEN")
-	}
-	if token == "" || strings.TrimSpace(jti) == "" {
-		return errors.New("--token and --jti are required")
-	}
-
-	body, err := doAdminJSON(http.MethodPost, strings.TrimRight(hubURL, "/")+"/admin/tokens/revoke", token, admin.RevokePayload{JTI: jti})
-	if err != nil {
-		return err
-	}
-	_, _ = fmt.Fprintf(os.Stdout, "%s\n", strings.TrimSpace(string(body)))
-	return nil
-}
-
-func runTarget(args []string) error {
-	if len(args) < 1 {
-		return errors.New("expected subcommand: target list | target kick")
-	}
-
-	switch args[0] {
-	case "list":
-		fs := flag.NewFlagSet("target list", flag.ExitOnError)
-		var (
-			hubURL string
-			token  string
-			tag    string
-		)
-		fs.StringVar(&hubURL, "hub", "http://127.0.0.1:8443", "Hub base HTTP URL")
-		fs.StringVar(&token, "token", "", "Admin Bearer token (or REVMCP_ADMIN_TOKEN env)")
-		fs.StringVar(&tag, "tag", "", "Optional tag filter (key=value)")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
-		}
-		if token == "" {
-			token = os.Getenv("REVMCP_ADMIN_TOKEN")
-		}
-		if token == "" {
-			return errors.New("--token (or REVMCP_ADMIN_TOKEN) is required")
-		}
-
-		endpoint := strings.TrimRight(hubURL, "/") + "/admin/targets"
-		if tag != "" {
-			endpoint += "?tag=" + url.QueryEscape(tag)
-		}
-		body, err := doAdminJSON(http.MethodGet, endpoint, token, nil)
-		if err != nil {
-			return err
-		}
-		_, _ = fmt.Fprintf(os.Stdout, "%s\n", strings.TrimSpace(string(body)))
-		return nil
-
-	case "kick":
-		fs := flag.NewFlagSet("target kick", flag.ExitOnError)
-		var (
-			hubURL                  string
-			token                   string
-			targetID                string
-			reason                  string
-			selfDestruct            bool
-			configPath, channelName string
-		)
-		fs.StringVar(&hubURL, "hub", "http://127.0.0.1:8443", "Hub base HTTP URL")
-		fs.StringVar(&token, "token", "", "Admin Bearer token (or REVMCP_ADMIN_TOKEN env)")
-		fs.StringVar(&targetID, "target", "", "Target ID to disconnect/shutdown")
-		fs.StringVar(&configPath, "config", "", "Hub management configuration")
-		fs.StringVar(&channelName, "channel", "", "Channel containing the target")
-		fs.StringVar(&reason, "reason", "operator requested shutdown", "Reason recorded in audit log")
-		fs.BoolVar(&selfDestruct, "self-destruct", false, "Also delete the agent binary from disk on exit")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
-		}
-		if channelName != "" || configPath != "" {
-			if !channel.ValidName(channelName) || !channel.ValidName(targetID) {
-				return errors.New("valid --channel and --target are required")
-			}
-			endpoint := "/admin/channels/" + url.PathEscape(channelName) + "/targets/" + url.PathEscape(targetID) + "/shutdown"
-			return printChannelResponse(configPath, http.MethodPost, endpoint, admin.ShutdownPayload{
-				Reason: reason, SelfDestruct: selfDestruct,
-			})
-		}
-		if token == "" {
-			token = os.Getenv("REVMCP_ADMIN_TOKEN")
-		}
-		if token == "" || strings.TrimSpace(targetID) == "" {
-			return errors.New("--token and --target are required")
-		}
-
-		endpoint := strings.TrimRight(hubURL, "/") + "/admin/targets/" + url.PathEscape(targetID) + "/shutdown"
-		body, err := doAdminJSON(http.MethodPost, endpoint, token, admin.ShutdownPayload{
-			Reason:       reason,
-			SelfDestruct: selfDestruct,
-		})
-		if err != nil {
-			return err
-		}
-		_, _ = fmt.Fprintf(os.Stdout, "%s\n", strings.TrimSpace(string(body)))
-		return nil
-
-	default:
-		return fmt.Errorf("unknown target subcommand %q (expected list or kick)", args[0])
+		return fmt.Errorf("unknown token subcommand %q", args[0])
 	}
 }
 

@@ -17,11 +17,13 @@ type Caller interface {
 
 // Entry represents a live registered Agent in the Hub registry.
 type Entry struct {
-	Info        proto.AgentInfo
-	Caller      Caller
-	ConnectedAt time.Time
-	Generation  uint64
-	pending     bool
+	ChannelID           string
+	Info                proto.AgentInfo
+	Caller              Caller
+	ConnectedAt         time.Time
+	EnrollmentExpiresAt time.Time
+	Generation          uint64
+	pending             bool
 }
 
 type key struct {
@@ -29,7 +31,7 @@ type key struct {
 	targetID  string
 }
 
-// Registry indexes online Agents by channel and target. An empty channel is the legacy namespace.
+// Registry indexes online Agents by channel and target.
 type Registry struct {
 	mu      sync.RWMutex
 	entries map[key]*Entry
@@ -40,30 +42,21 @@ func New() *Registry {
 	return &Registry{entries: make(map[key]*Entry)}
 }
 
-func (r *Registry) Register(info proto.AgentInfo, caller Caller) (entry, replaced *Entry) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	k := key{targetID: info.TargetID}
-	replaced = r.entries[k]
-	return r.add(k, info, caller, false), replaced
-}
-
 // Reserve refuses a second connection for a managed target, including one still registering.
-func (r *Registry) Reserve(channelID string, info proto.AgentInfo, caller Caller) (*Entry, bool) {
+func (r *Registry) Reserve(channelID string, info proto.AgentInfo, caller Caller, enrollmentExpiresAt time.Time) (*Entry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	k := key{channelID, info.TargetID}
 	if _, exists := r.entries[k]; exists {
 		return nil, false
 	}
-	return r.add(k, info, caller, true), true
-}
-
-func (r *Registry) add(k key, info proto.AgentInfo, caller Caller, pending bool) *Entry {
 	r.gen++
-	entry := &Entry{Info: info, Caller: caller, Generation: r.gen, ConnectedAt: time.Now().UTC(), pending: pending}
+	entry := &Entry{
+		ChannelID: channelID, Info: info, Caller: caller, Generation: r.gen,
+		ConnectedAt: time.Now().UTC(), EnrollmentExpiresAt: enrollmentExpiresAt, pending: true,
+	}
 	r.entries[k] = entry
-	return entry
+	return entry, true
 }
 
 func (r *Registry) Activate(channelID, targetID string, generation uint64) {
@@ -72,10 +65,6 @@ func (r *Registry) Activate(channelID, targetID string, generation uint64) {
 	if entry := r.entries[key{channelID, targetID}]; entry != nil && entry.Generation == generation {
 		entry.pending = false
 	}
-}
-
-func (r *Registry) Unregister(targetID string, generation uint64) bool {
-	return r.UnregisterIn("", targetID, generation)
 }
 
 func (r *Registry) UnregisterIn(channelID, targetID string, generation uint64) bool {
@@ -90,10 +79,6 @@ func (r *Registry) UnregisterIn(channelID, targetID string, generation uint64) b
 	return true
 }
 
-func (r *Registry) Get(targetID string) (*Entry, bool) {
-	return r.GetIn("", targetID)
-}
-
 func (r *Registry) GetIn(channelID, targetID string) (*Entry, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -102,10 +87,6 @@ func (r *Registry) GetIn(channelID, targetID string) (*Entry, bool) {
 		return nil, false
 	}
 	return entry, true
-}
-
-func (r *Registry) List(tagKey, tagVal string) []*Entry {
-	return r.ListIn("", tagKey, tagVal)
 }
 
 func (r *Registry) ListIn(channelID, tagKey, tagVal string) []*Entry {
@@ -128,6 +109,25 @@ func (r *Registry) ListIn(channelID, tagKey, tagVal string) []*Entry {
 		return out[i].Info.TargetID < out[j].Info.TargetID
 	})
 	return out
+}
+
+// ExpiredEnrollments snapshots live connections admitted with credentials that have expired.
+func (r *Registry) ExpiredEnrollments(now time.Time) []*Entry {
+	r.mu.RLock()
+	var entries []*Entry
+	for _, entry := range r.entries {
+		if !entry.pending && !entry.EnrollmentExpiresAt.After(now) {
+			entries = append(entries, entry)
+		}
+	}
+	r.mu.RUnlock()
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].ChannelID != entries[j].ChannelID {
+			return entries[i].ChannelID < entries[j].ChannelID
+		}
+		return entries[i].Info.TargetID < entries[j].Info.TargetID
+	})
+	return entries
 }
 
 func (r *Registry) Detach(channelID string) []Caller {

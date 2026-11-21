@@ -465,11 +465,6 @@ func (s *Store) active(kind string, value credential, now int64) bool {
 
 func prefix(kind string) string { return "revmcp-" + kind + "-v1." }
 
-// Managed reports whether a token uses the managed format, of either kind.
-func Managed(token string) bool {
-	return strings.HasPrefix(token, prefix(Agent)) || strings.HasPrefix(token, prefix(MCP))
-}
-
 func (s *Store) sign(record Record, kind string, value credential) string {
 	payload := claims{Kind: kind, ID: record.ID, Version: value.Version, Expires: value.Expires, Target: record.Policy.Target}
 	if kind == Agent {

@@ -34,6 +34,18 @@ func TestChannelCLIRequests(t *testing.T) {
 				payload.Policy.MCPScopes[0] != "read" {
 				t.Error("issue flags were not forwarded to the Hub")
 			}
+		case "POST /admin/targets/expired/shutdown":
+			var payload admin.ShutdownPayload
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.SelfDestruct {
+				t.Errorf("invalid bulk shutdown payload: %+v, %v", payload, err)
+			}
+			result := admin.ExpiredShutdownResult{Targets: []admin.ExpiredShutdownTarget{}}
+			if payload.Reason == "partial failure" {
+				result.Targets = append(result.Targets, admin.ExpiredShutdownTarget{TargetID: "node-1", Error: "offline"})
+				result.Failed = 1
+			}
+			_ = json.NewEncoder(w).Encode(result)
+			return
 		case "GET /admin/channels", "GET /admin/channels/one",
 			"POST /admin/channels/one/reveal", "POST /admin/channels/one/rotate/mcp",
 			"POST /admin/channels/one/revoke/agent", "DELETE /admin/channels/one",
@@ -71,13 +83,25 @@ func TestChannelCLIRequests(t *testing.T) {
 	if err := runTarget([]string{"kick", "--config", cfg, "--channel", "one", "--target", "node-1"}); err != nil {
 		t.Fatal(err)
 	}
+	bulk := []string{"kick", "--config", cfg, "--expired"}
+	if err := runTarget(bulk); err != nil {
+		t.Fatal(err)
+	}
+	if err := runTarget(append(bulk, "--reason", "partial failure")); err == nil {
+		t.Fatal("expected a nonzero result after a partial shutdown failure")
+	}
+	for _, flag := range []string{"--channel=one", "--target=node-1", "--self-destruct"} {
+		if err := runTarget(append(bulk, flag)); err == nil {
+			t.Fatalf("bulk shutdown accepted %s", flag)
+		}
+	}
 	if err := runChannel([]string{"delete", "--config", cfg, "--name", "one"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := runToken([]string{"issue", "--config", cfg, "--name", "one", "--allowed-target", "node-1", "--ttl", "500ms"}); err == nil {
 		t.Fatal("issue accepted a duration shorter than one second")
 	}
-	if count := requests.Load(); count != 8 {
-		t.Fatalf("expected eight requests, got %d", count)
+	if count := requests.Load(); count != 10 {
+		t.Fatalf("expected ten requests, got %d", count)
 	}
 }

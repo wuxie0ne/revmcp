@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
@@ -15,8 +16,8 @@ import (
 )
 
 type ManagementConfig struct {
-	HubURL      string `yaml:"hub_url"`
-	AdminClient string `yaml:"admin_client"`
+	HubURL           string `yaml:"hub_url"`
+	AdminTokenSHA256 string `yaml:"admin_token_sha256"`
 }
 
 type ChannelsConfig struct {
@@ -70,9 +71,6 @@ func applyIssuePolicy(dst *channel.Policy, src IssuePolicy) {
 }
 
 func (c *Config) validateChannels() error {
-	if c.Tokens == nil {
-		return nil
-	}
 	if len(strings.TrimSpace(c.Tokens.SigningSecret)) < 16 || c.Tokens.SigningSecret == c.AgentSigningSecret ||
 		strings.TrimSpace(c.Tokens.StatePath) == "" {
 		return errors.New("config: tokens requires a state_path and a distinct mcp_signing_secret of at least 16 bytes")
@@ -85,16 +83,15 @@ func (c *Config) validateChannels() error {
 	if _, err := c.Tokens.Resolve("", IssuePolicy{Target: "validate-defaults"}); err != nil {
 		return fmt.Errorf("config: token defaults: %w", err)
 	}
-	for _, client := range c.Clients {
-		if client.Name == c.Management.AdminClient {
-			for _, scope := range client.Scopes {
-				if scope == "admin" {
-					return nil
-				}
-			}
-		}
+	if _, err := ValidateHubURL(c.Management.HubURL); err != nil {
+		return err
 	}
-	return errors.New("config: management.admin_client must name a client with the admin scope")
+	digest := strings.TrimSpace(c.Management.AdminTokenSHA256)
+	if decoded, err := hex.DecodeString(digest); err != nil || len(decoded) != 32 {
+		return errors.New("config: management.admin_token_sha256 must be 64 hex chars")
+	}
+	c.Management.AdminTokenSHA256 = digest
+	return nil
 }
 
 func LoadManagementURL(configPath string) (string, error) {
@@ -121,7 +118,7 @@ func ValidateHubURL(value string) (string, error) {
 }
 
 func (c *Config) resolveStatePath(configPath string) {
-	if c.Tokens != nil && !filepath.IsAbs(c.Tokens.StatePath) {
+	if !filepath.IsAbs(c.Tokens.StatePath) {
 		c.Tokens.StatePath = filepath.Join(filepath.Dir(configPath), c.Tokens.StatePath)
 	}
 }

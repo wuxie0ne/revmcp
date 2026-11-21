@@ -29,7 +29,7 @@
 - **极致兼容性**：Agent 使用 `CGO_ENABLED=0` 全静态编译，无任何动态库依赖，支持 Linux `amd64`/`arm64`，可在 CentOS 7（`glibc 2.17` / kernel 3.10）、Alpine、Scratch/Distroless 容器直接运行（Agent 模块兼容 Go 1.23 编译，可覆盖更老内核环境）。
 - **资源占用**：Agent 单文件体积 `< 10MB`（开启 `-s -w` 裁剪），空载常驻内存 `< 20MB`。
 - **带宽与上下文防爆**：单次工具输出在 Agent 端即强制截断（默认上限 `32KB`，可调最大 `128KB`），严禁将百 MB 日志通过隧道传回 Hub 或撑爆 LLM 上下文。
-- **断线自愈**：Yamux keepalive 检测静默断线，Agent 指数退避重连。渠道内同名目标须等旧连接清理后重新注册，旧版目标空间允许同名接管。
+- **断线自愈**：Yamux keepalive 检测静默断线，Agent 指数退避重连。渠道内同名目标须等旧连接清理后重新注册。
 
 ## 4. 明确非目标（Out of Scope）
 

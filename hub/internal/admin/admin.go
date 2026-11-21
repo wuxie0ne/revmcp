@@ -1,116 +1,57 @@
 package admin
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	sdkauth "github.com/modelcontextprotocol/go-sdk/auth"
-	hubauth "github.com/revmcp/revmcp/hub/internal/auth"
 	"github.com/revmcp/revmcp/hub/internal/channel"
 	"github.com/revmcp/revmcp/hub/internal/policy"
 	"github.com/revmcp/revmcp/hub/internal/registry"
 	"github.com/revmcp/revmcp/proto"
 )
 
-// TargetDetail describes an online agent returned by GET /admin/targets.
-type TargetDetail struct {
-	TargetID      string            `json:"target_id"`
-	InstanceID    string            `json:"instance_id,omitempty"`
-	Hostname      string            `json:"hostname"`
-	OS            string            `json:"os"`
-	Kernel        string            `json:"kernel"`
-	Arch          string            `json:"arch"`
-	InContainer   bool              `json:"in_container"`
-	Mode          proto.Mode        `json:"mode"`
-	Version       string            `json:"version"`
-	Tags          map[string]string `json:"tags,omitempty"`
-	ConnectedAt   time.Time         `json:"connected_at"`
-	OnlineSeconds int64             `json:"online_seconds"`
-}
-
-// ShutdownPayload is the JSON request body for POST /admin/targets/{target_id}/shutdown.
+// ShutdownPayload is the JSON request body for channel target shutdown.
 type ShutdownPayload struct {
 	Reason       string `json:"reason,omitempty"`
 	SelfDestruct bool   `json:"self_destruct,omitempty"`
 }
 
-// RevokePayload is the JSON request body for POST /admin/tokens/revoke.
-type RevokePayload struct {
-	JTI string `json:"jti"`
+type ExpiredShutdownResult struct {
+	Targets []ExpiredShutdownTarget `json:"targets"`
+	Failed  int                     `json:"failed"`
+}
+
+type ExpiredShutdownTarget struct {
+	ChannelID string `json:"channel_id"`
+	TargetID  string `json:"target_id"`
+	Accepted  bool   `json:"accepted"`
+	Error     string `json:"error,omitempty"`
 }
 
 // Handler serves authenticated Hub Admin HTTP endpoints (never exposed as MCP tools to LLMs).
 type Handler struct {
 	registry *registry.Registry
-	signer   *hubauth.EnrollmentSigner
 	audit    *policy.AuditLogger
 	channels *channel.Store
 }
 
 // NewHandler creates an Admin HTTP Handler.
-func NewHandler(reg *registry.Registry, signer *hubauth.EnrollmentSigner, audit *policy.AuditLogger) *Handler {
+func NewHandler(reg *registry.Registry, store *channel.Store, audit *policy.AuditLogger) *Handler {
 	return &Handler{
 		registry: reg,
-		signer:   signer,
+		channels: store,
 		audit:    audit,
 	}
-}
-
-// RegisterRoutes mounts /admin/* endpoints behind Bearer auth requiring the "admin" scope.
-func (h *Handler) RegisterRoutes(mux *http.ServeMux, verifier sdkauth.TokenVerifier) {
-	authMW := sdkauth.RequireBearerToken(verifier, &sdkauth.RequireBearerTokenOptions{
-		AllowMissingExpiration: true,
-		Scopes:                 []string{policy.ScopeAdmin},
-	})
-
-	mux.Handle("GET /admin/targets", authMW(http.HandlerFunc(h.handleListTargets)))
-	mux.Handle("POST /admin/targets/{target_id}/shutdown", authMW(http.HandlerFunc(h.handleShutdownTarget)))
-	mux.Handle("POST /admin/tokens/revoke", authMW(http.HandlerFunc(h.handleRevokeToken)))
-	mux.Handle("GET /admin/tokens/revoked", authMW(http.HandlerFunc(h.handleListRevoked)))
-}
-
-func (h *Handler) handleListTargets(w http.ResponseWriter, r *http.Request) {
-	info := sdkauth.TokenInfoFromContext(r.Context())
-	if err := policy.Authorize(info, policy.ScopeAdmin, ""); err != nil {
-		writeJSONError(w, http.StatusForbidden, err.Error())
-		return
-	}
-
-	tagKey, tagVal, _ := strings.Cut(strings.TrimSpace(r.URL.Query().Get("tag")), "=")
-	allowed := hubauth.AllowedTargetsFromToken(info)
-	entries := h.registry.List(tagKey, tagVal)
-
-	targets := make([]TargetDetail, 0, len(entries))
-	for _, e := range entries {
-		if !policy.TargetAllowed(allowed, e.Info.TargetID) {
-			continue
-		}
-		targets = append(targets, TargetDetail{
-			TargetID:      e.Info.TargetID,
-			InstanceID:    e.Info.InstanceID,
-			Hostname:      e.Info.Hostname,
-			OS:            e.Info.OS,
-			Kernel:        e.Info.Kernel,
-			Arch:          e.Info.Arch,
-			InContainer:   e.Info.InContainer,
-			Mode:          e.Info.Mode,
-			Version:       e.Info.Version,
-			Tags:          e.Info.Tags,
-			ConnectedAt:   e.ConnectedAt,
-			OnlineSeconds: int64(time.Since(e.ConnectedAt).Seconds()),
-		})
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{"targets": targets})
-}
-
-func (h *Handler) handleShutdownTarget(w http.ResponseWriter, r *http.Request) {
-	h.shutdownTarget(w, r, "")
 }
 
 func (h *Handler) shutdownTarget(w http.ResponseWriter, r *http.Request, channelID string) {
@@ -119,18 +60,15 @@ func (h *Handler) shutdownTarget(w http.ResponseWriter, r *http.Request, channel
 	info := sdkauth.TokenInfoFromContext(r.Context())
 	targetID := strings.TrimSpace(r.PathValue("target_id"))
 
-	var payload ShutdownPayload
-	if r.Body != nil {
-		defer func() { _ = r.Body.Close() }()
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&payload); err != nil && err.Error() != "EOF" {
-			h.auditEvent(traceID, info, channelID, targetID, "admin.shutdown", nil, "deny", "invalid json payload", time.Since(start))
-			writeJSONError(w, http.StatusBadRequest, "invalid json payload")
-			return
-		}
+	payload, err := readShutdownPayload(w, r)
+	if err != nil {
+		h.auditEvent(traceID, info, channelID, targetID, "admin.shutdown", nil, "deny", "invalid json payload", time.Since(start))
+		writeJSONError(w, http.StatusBadRequest, "invalid json payload")
+		return
 	}
 
 	args := map[string]any{"reason": payload.Reason, "self_destruct": payload.SelfDestruct}
-	if err := policy.Authorize(info, policy.ScopeAdmin, targetID); err != nil {
+	if err := policy.Authorize(info, policy.ScopeAdmin, ""); err != nil {
 		h.auditEvent(traceID, info, channelID, targetID, "admin.shutdown", args, "deny", err.Error(), time.Since(start))
 		writeJSONError(w, http.StatusForbidden, err.Error())
 		return
@@ -144,64 +82,107 @@ func (h *Handler) shutdownTarget(w http.ResponseWriter, r *http.Request, channel
 		return
 	}
 
-	var res proto.ShutdownResult
-	callCtx := policy.WithTraceID(r.Context(), traceID)
-	if err := entry.Caller.Call(callCtx, proto.MethodAgentShutdown, proto.ShutdownRequest{
-		Reason:       payload.Reason,
-		SelfDestruct: payload.SelfDestruct,
-	}, &res); err != nil {
-		h.auditEvent(traceID, info, channelID, targetID, "admin.shutdown", args, "deny", err.Error(), time.Since(start))
+	accepted, err := h.requestShutdown(r.Context(), traceID, info, entry, payload)
+	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 
-	h.auditEvent(traceID, info, channelID, targetID, "admin.shutdown", args, "allow", "", time.Since(start))
 	writeJSON(w, http.StatusOK, map[string]any{
-		"accepted":      res.Accepted,
+		"accepted":      accepted,
 		"target_id":     targetID,
 		"self_destruct": payload.SelfDestruct,
 	})
 }
 
-func (h *Handler) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) kickExpiredTargets(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	traceID := newTraceID()
 	info := sdkauth.TokenInfoFromContext(r.Context())
-
+	payload, err := readShutdownPayload(w, r)
+	if err != nil || payload.SelfDestruct {
+		const reason = "expected a shutdown payload without self_destruct"
+		h.auditEvent(traceID, info, "", "", "admin.shutdown_expired", nil, "deny", reason, time.Since(start))
+		writeJSONError(w, http.StatusBadRequest, reason)
+		return
+	}
 	if err := policy.Authorize(info, policy.ScopeAdmin, ""); err != nil {
-		h.auditEvent(traceID, info, "", "", "admin.token.revoke", nil, "deny", err.Error(), time.Since(start))
+		h.auditEvent(traceID, info, "", "", "admin.shutdown_expired", nil, "deny", err.Error(), time.Since(start))
 		writeJSONError(w, http.StatusForbidden, err.Error())
 		return
 	}
-
-	var payload RevokePayload
-	if r.Body == nil {
-		writeJSONError(w, http.StatusBadRequest, "missing request body")
-		return
-	}
-	defer func() { _ = r.Body.Close() }()
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&payload); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid json payload")
-		return
-	}
-	jti := strings.TrimSpace(payload.JTI)
-	if jti == "" {
-		writeJSONError(w, http.StatusBadRequest, "jti is required")
-		return
+	if payload.Reason == "" {
+		payload.Reason = "Agent enrollment credential expired"
 	}
 
-	h.signer.Revoke(jti)
-	h.auditEvent(traceID, info, "", "", "admin.token.revoke", map[string]any{"jti": jti}, "allow", "", time.Since(start))
-	writeJSON(w, http.StatusOK, map[string]any{"revoked": true, "jti": jti})
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	entries := h.registry.ExpiredEnrollments(time.Now())
+	result := ExpiredShutdownResult{Targets: make([]ExpiredShutdownTarget, len(entries))}
+	workers := min(8, len(entries))
+	var group sync.WaitGroup
+	for worker := range workers {
+		group.Go(func() {
+			for i := worker; i < len(entries); i += workers {
+				entry := entries[i]
+				callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+				accepted, err := h.requestShutdown(callCtx, newTraceID(), info, entry, payload)
+				cancel()
+				target := ExpiredShutdownTarget{ChannelID: entry.ChannelID, TargetID: entry.Info.TargetID, Accepted: accepted}
+				switch {
+				case err != nil:
+					target.Error = err.Error()
+				case !accepted:
+					target.Error = "Agent did not accept the shutdown request"
+				}
+				result.Targets[i] = target
+			}
+		})
+	}
+	group.Wait()
+	for _, target := range result.Targets {
+		if !target.Accepted {
+			result.Failed++
+		}
+	}
+	h.auditEvent(traceID, info, "", "", "admin.shutdown_expired",
+		map[string]any{"matched": len(entries), "failed": result.Failed, "reason": payload.Reason},
+		"allow", "", time.Since(start))
+	writeJSON(w, http.StatusOK, result)
 }
 
-func (h *Handler) handleListRevoked(w http.ResponseWriter, r *http.Request) {
-	info := sdkauth.TokenInfoFromContext(r.Context())
-	if err := policy.Authorize(info, policy.ScopeAdmin, ""); err != nil {
-		writeJSONError(w, http.StatusForbidden, err.Error())
-		return
+func readShutdownPayload(w http.ResponseWriter, r *http.Request) (ShutdownPayload, error) {
+	var payload ShutdownPayload
+	if r.Body == nil {
+		return payload, nil
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"revoked_jtis": h.signer.RevokedJTIs()})
+	defer func() { _ = r.Body.Close() }()
+	err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&payload)
+	if errors.Is(err, io.EOF) {
+		err = nil
+	}
+	return payload, err
+}
+
+func (h *Handler) requestShutdown(ctx context.Context, traceID string, info *sdkauth.TokenInfo, entry *registry.Entry, payload ShutdownPayload) (bool, error) {
+	start := time.Now()
+	var res proto.ShutdownResult
+	err := ctx.Err()
+	if err == nil {
+		err = entry.Caller.Call(policy.WithTraceID(ctx, traceID), proto.MethodAgentShutdown, proto.ShutdownRequest{
+			Reason: payload.Reason, SelfDestruct: payload.SelfDestruct,
+		}, &res)
+	}
+	decision, reason := "allow", ""
+	switch {
+	case err != nil:
+		decision, reason = "deny", err.Error()
+	case !res.Accepted:
+		decision, reason = "deny", "Agent did not accept the shutdown request"
+	}
+	args := map[string]any{"reason": payload.Reason, "self_destruct": payload.SelfDestruct}
+	h.auditEvent(traceID, info, entry.ChannelID, entry.Info.TargetID, "admin.shutdown", args, decision, reason, time.Since(start))
+	return err == nil && res.Accepted, err
 }
 
 func (h *Handler) auditEvent(traceID string, info *sdkauth.TokenInfo, channelID, targetID, tool string, args map[string]any, decision, reason string, dur time.Duration) {

@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -153,15 +152,8 @@ func printChannelList(channels []channel.Detail, details bool) error {
 	return table.Flush()
 }
 
-func changeChannelCredential(configPath, name, kind, operation string) error {
-	if !channel.ValidName(name) || !slices.Contains([]string{channel.Agent, channel.MCP}, kind) {
-		return errors.New("valid --channel and --kind agent|mcp are required")
-	}
-	return printChannelResponse(configPath, http.MethodPost, channelEndpoint(name)+"/"+operation+"/"+kind, nil)
-}
-
-func runTokenRotate(args []string) error {
-	fs := flag.NewFlagSet("token rotate", flag.ContinueOnError)
+func runTokenChange(args []string, operation string) error {
+	fs := flag.NewFlagSet("token "+operation, flag.ContinueOnError)
 	var configPath, name, kind string
 	fs.StringVar(&configPath, "config", "", "Hub management configuration")
 	fs.StringVar(&name, "channel", "", "Channel name")
@@ -169,7 +161,10 @@ func runTokenRotate(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	return changeChannelCredential(configPath, name, kind, "rotate")
+	if !channel.ValidName(name) || (kind != channel.Agent && kind != channel.MCP) {
+		return errors.New("valid --channel and --kind agent|mcp are required")
+	}
+	return printChannelResponse(configPath, http.MethodPost, channelEndpoint(name)+"/"+operation+"/"+kind, nil)
 }
 
 func runChannel(args []string) error {
@@ -187,4 +182,54 @@ func runChannel(args []string) error {
 		return errors.New("valid --name is required")
 	}
 	return printChannelResponse(configPath, http.MethodDelete, channelEndpoint(name), nil)
+}
+
+func runTarget(args []string) error {
+	if len(args) == 0 || args[0] != "kick" {
+		return errors.New("expected subcommand: target kick")
+	}
+	fs := flag.NewFlagSet("target kick", flag.ContinueOnError)
+	var configPath, name, targetID string
+	var payload admin.ShutdownPayload
+	var expired bool
+	fs.StringVar(&configPath, "config", "", "Hub management configuration")
+	fs.StringVar(&name, "channel", "", "Channel containing the target")
+	fs.StringVar(&targetID, "target", "", "Target ID to disconnect")
+	fs.BoolVar(&expired, "expired", false, "Shut down every online Agent whose enrollment credential has expired")
+	fs.StringVar(&payload.Reason, "reason", "", "Reason recorded in audit log")
+	fs.BoolVar(&payload.SelfDestruct, "self-destruct", false, "Also delete the Agent binary from disk on exit")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("unexpected positional arguments to target kick")
+	}
+	if expired {
+		if name != "" || targetID != "" || payload.SelfDestruct {
+			return errors.New("--expired cannot be combined with --channel, --target, or --self-destruct")
+		}
+		body, err := channelRequest(configPath, http.MethodPost, "/admin/targets/expired/shutdown", payload)
+		if err != nil {
+			return err
+		}
+		var result admin.ExpiredShutdownResult
+		if err := json.Unmarshal(body, &result); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintln(os.Stdout, strings.TrimSpace(string(body))); err != nil {
+			return err
+		}
+		if result.Failed > 0 {
+			return fmt.Errorf("shutdown failed for %d of %d Agents", result.Failed, len(result.Targets))
+		}
+		return nil
+	}
+	if !channel.ValidName(name) || !channel.ValidName(targetID) {
+		return errors.New("valid --channel and --target are required")
+	}
+	if payload.Reason == "" {
+		payload.Reason = "operator requested shutdown"
+	}
+	endpoint := channelEndpoint(name) + "/targets/" + url.PathEscape(targetID) + "/shutdown"
+	return printChannelResponse(configPath, http.MethodPost, endpoint, payload)
 }

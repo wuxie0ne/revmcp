@@ -19,22 +19,14 @@ type IssueChannel struct {
 	Policy  config.IssuePolicy `json:"policy"`
 }
 
-func (h *Handler) RegisterChannelRoutes(mux *http.ServeMux, static sdkauth.TokenVerifier, cfg *config.Config, store *channel.Store) {
-	h.channels = store
-	adminAuth := sdkauth.RequireBearerToken(static, &sdkauth.RequireBearerTokenOptions{
+func (h *Handler) RegisterRoutes(mux *http.ServeMux, verifier sdkauth.TokenVerifier, policies config.ChannelsConfig) {
+	adminAuth := sdkauth.RequireBearerToken(verifier, &sdkauth.RequireBearerTokenOptions{
 		AllowMissingExpiration: true,
 		Scopes:                 []string{policy.ScopeAdmin},
 	})
 	add := func(pattern string, handler http.HandlerFunc) {
 		mux.Handle(pattern, adminAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Cache-Control", "no-store")
-			info := sdkauth.TokenInfoFromContext(r.Context())
-			if info == nil || info.UserID != cfg.Management.AdminClient {
-				id, _ := store.ID(r.PathValue("channel"))
-				h.auditEvent(newTraceID(), info, id, "", "admin.channel.authorize", nil, "deny", "channel administrator required", 0)
-				writeJSONError(w, http.StatusForbidden, "channel administrator required")
-				return
-			}
 			handler(w, r)
 		})))
 	}
@@ -47,10 +39,10 @@ func (h *Handler) RegisterChannelRoutes(mux *http.ServeMux, static sdkauth.Token
 			writeJSONError(w, http.StatusBadRequest, "invalid issuance request")
 			return
 		}
-		resolved, err := cfg.Tokens.Resolve(issue.Profile, issue.Policy)
+		resolved, err := policies.Resolve(issue.Profile, issue.Policy)
 		var detail channel.Detail
 		if err == nil {
-			detail, err = store.Issue(issue.Name, resolved)
+			detail, err = h.channels.Issue(issue.Name, resolved)
 		}
 		h.channelResponse(w, r, "issue", issue.Name, detail.ChannelID, "", http.StatusCreated, detail, err)
 	})
@@ -66,6 +58,7 @@ func (h *Handler) RegisterChannelRoutes(mux *http.ServeMux, static sdkauth.Token
 	add("POST /admin/channels/{channel}/{operation}/{kind}", h.changeCredential)
 	add("DELETE /admin/channels/{channel}", h.deleteChannel)
 	add("POST /admin/channels/{channel}/targets/{target_id}/shutdown", h.kickChannelTarget)
+	add("POST /admin/targets/expired/shutdown", h.kickExpiredTargets)
 }
 
 func (h *Handler) listChannels(w http.ResponseWriter, r *http.Request, name string, reveal bool) {

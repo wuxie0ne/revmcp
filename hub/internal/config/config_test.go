@@ -15,11 +15,12 @@ listen: "127.0.0.1:8443"
 tunnel_listen: "0.0.0.0:9443"
 agent_signing_secret: "secret-key-for-unit-test-1234"
 audit_log_path: "-"
-clients:
-  - name: "ops"
-    token_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-    scopes: ["read"]
-    allowed_targets: ["*"]
+management:
+  hub_url: "http://127.0.0.1:8443"
+  admin_token_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+tokens:
+  mcp_signing_secret: "mcp-key-for-test-config"
+  state_path: ./state.json
 `
 	p := filepath.Join(t.TempDir(), "hub.yaml")
 	if err := os.WriteFile(p, []byte(yamlData), 0o600); err != nil {
@@ -45,7 +46,7 @@ func TestManagedChannelPolicyAndManagementURL(t *testing.T) {
 agent_signing_secret: "agent-key-for-test-config"
 management:
   hub_url: "${TEST_REVMCP_MANAGEMENT_URL}"
-  admin_client: operator
+  admin_token_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
 tokens:
   mcp_signing_secret: "mcp-key-for-test-config"
   state_path: ./state.json
@@ -57,11 +58,6 @@ tokens:
     fleet:
       target: "node-*"
       agent_ttl: 30m
-clients:
-  - name: operator
-    token_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-    scopes: ["admin"]
-    allowed_targets: ["*"]
 `)
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatal(err)
@@ -78,11 +74,18 @@ clients:
 	if base, err := LoadManagementURL(path); err != nil || base != "http://127.0.0.1:40051" {
 		t.Fatalf("unexpected management URL %q: %v", base, err)
 	}
-	cfg.Clients[0].Scopes = []string{"read"}
+	digest := cfg.Management.AdminTokenSHA256
+	cfg.Management.AdminTokenSHA256 = "invalid"
 	if err := cfg.Validate(); err == nil {
-		t.Fatal("managed channel configuration accepted an administrator without admin scope")
+		t.Fatal("accepted an invalid administrator digest")
 	}
-	cfg.Clients[0].Scopes = []string{"admin"}
+	cfg.Management.AdminTokenSHA256 = digest
+	channels := cfg.Tokens
+	cfg.Tokens = ChannelsConfig{}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("accepted missing channel settings")
+	}
+	cfg.Tokens = channels
 	for _, invalidSecret := range []string{"short", cfg.AgentSigningSecret} {
 		cfg.Tokens.SigningSecret = invalidSecret
 		if err := cfg.Validate(); err == nil {

@@ -19,6 +19,7 @@ import (
 
 	"github.com/revmcp/revmcp/hub/internal/admin"
 	hubauth "github.com/revmcp/revmcp/hub/internal/auth"
+	"github.com/revmcp/revmcp/hub/internal/channel"
 	"github.com/revmcp/revmcp/hub/internal/config"
 	"github.com/revmcp/revmcp/hub/internal/mcpserver"
 	"github.com/revmcp/revmcp/hub/internal/policy"
@@ -105,36 +106,44 @@ func TestRealAgentBinaryFullLifecycleAndSelfDestruct(t *testing.T) {
 
 	const adminTok = "e2e-admin-bearer-secret"
 	sum := sha256.Sum256([]byte(adminTok))
-	verifier, err := hubauth.NewStaticBearerVerifier([]config.ClientConfig{
-		{
-			Name:           "e2e-sre",
-			TokenSHA256:    hex.EncodeToString(sum[:]),
-			Scopes:         []string{policy.ScopeRead, policy.ScopeExecRestricted, policy.ScopeExecFull, policy.ScopeExecSession, policy.ScopeAdmin},
-			AllowedTargets: []string{"*"},
-		},
-	})
+	verifier, err := hubauth.NewAdminBearerVerifier(hex.EncodeToString(sum[:]))
 	if err != nil {
-		t.Fatalf("NewStaticBearerVerifier: %v", err)
+		t.Fatal(err)
 	}
-
-	signer, err := hubauth.NewEnrollmentSigner("e2e-signing-secret-key-1234567890")
+	store, err := channel.Open(filepath.Join(t.TempDir(), "channels.json"), "e2e-agent-signing-key", "e2e-mcp-signing-key", false)
 	if err != nil {
-		t.Fatalf("NewEnrollmentSigner: %v", err)
+		t.Fatal(err)
 	}
+	defer func() { _ = store.Close() }()
+	policies := config.ChannelsConfig{}
+	issue := func(name, target string, mode proto.Mode, scopes ...string) channel.Detail {
+		t.Helper()
+		p, err := policies.Resolve("", config.IssuePolicy{Target: target, Mode: mode, MCPScopes: scopes})
+		if err != nil {
+			t.Fatal(err)
+		}
+		detail, err := store.Issue(name, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return detail
+	}
+	credentials := issue("e2e", "e2e-node-01", proto.ModeFull,
+		policy.ScopeRead, policy.ScopeExecRestricted, policy.ScopeExecFull, policy.ScopeExecSession)
 
 	reg := registry.New()
 	var auditBuf syncBuffer
 	audit := policy.NewAuditLoggerWithWriter(&auditBuf)
 
 	// Separate southbound tunnel listener (custom high port) and northbound MCP/Admin listener.
-	tunnelSrv := tunnel.NewServer(signer, reg, audit, "e2e", 8, nil)
+	tunnelSrv := tunnel.NewServer(store, reg, audit, "e2e", 8, nil)
 	tunnelTS := httptest.NewServer(tunnelSrv)
 	defer tunnelTS.Close()
 
 	mcpMux := http.NewServeMux()
 	gw := mcpserver.NewGateway("e2e", reg, audit)
-	gw.RegisterRoutes(mcpMux, verifier)
-	admin.NewHandler(reg, signer, audit).RegisterRoutes(mcpMux, verifier)
+	gw.RegisterRoutes(mcpMux, hubauth.NewChannelBearerVerifier(store))
+	admin.NewHandler(reg, store, audit).RegisterRoutes(mcpMux, verifier, policies)
 	mcpTS := httptest.NewServer(mcpMux)
 	defer mcpTS.Close()
 
@@ -143,15 +152,11 @@ func TestRealAgentBinaryFullLifecycleAndSelfDestruct(t *testing.T) {
 	agentCopy := filepath.Join(tmpDir, "revmcp-agent-copy")
 	copyBinary(t, agentBin, agentCopy)
 
-	enrollTok, _, err := signer.Issue("e2e-node-01", proto.ModeFull, time.Hour)
-	if err != nil {
-		t.Fatalf("Issue enrollment token: %v", err)
-	}
-
 	wsURL := "ws" + strings.TrimPrefix(tunnelTS.URL, "http") + "/agent/ws"
 	agentCmd := exec.Command(agentCopy,
 		"--hub", wsURL,
-		"--token", enrollTok,
+		"--token", credentials.Enrollment,
+		"--target-id", "e2e-node-01",
 		"--mode", "full",
 		"--tag", "env=e2e",
 	)
@@ -169,19 +174,19 @@ func TestRealAgentBinaryFullLifecycleAndSelfDestruct(t *testing.T) {
 	// Wait for agent to come online in Hub registry.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, ok := reg.Get("e2e-node-01"); ok {
+		if _, ok := reg.GetIn(credentials.ChannelID, "e2e-node-01"); ok {
 			break
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	if _, ok := reg.Get("e2e-node-01"); !ok {
+	if _, ok := reg.GetIn(credentials.ChannelID, "e2e-node-01"); !ok {
 		t.Fatal("real agent binary failed to register with Hub over ws:// custom port")
 	}
 
 	ctx := context.Background()
 
 	// 1. MCP get_system_info via isolated /mcp/e2e-node-01.
-	status, body := mcpCall(t, ctx, mcpTS.URL+"/mcp/e2e-node-01", adminTok, map[string]any{
+	status, body := mcpCall(t, ctx, mcpTS.URL+"/mcp/e2e-node-01", credentials.Bearer, map[string]any{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
 		"params": map[string]any{"name": "get_system_info", "arguments": map[string]any{}},
 	})
@@ -190,7 +195,7 @@ func TestRealAgentBinaryFullLifecycleAndSelfDestruct(t *testing.T) {
 	}
 
 	// 2. Default deny policy blocks /etc/shadow over real RPC.
-	status, body = mcpCall(t, ctx, mcpTS.URL+"/mcp/e2e-node-01", adminTok, map[string]any{
+	status, body = mcpCall(t, ctx, mcpTS.URL+"/mcp/e2e-node-01", credentials.Bearer, map[string]any{
 		"jsonrpc": "2.0", "id": 2, "method": "tools/call",
 		"params": map[string]any{"name": "read_file", "arguments": map[string]any{"path": "/etc/shadow"}},
 	})
@@ -199,7 +204,7 @@ func TestRealAgentBinaryFullLifecycleAndSelfDestruct(t *testing.T) {
 	}
 
 	// 3. Stateful shell_session end-to-end: open -> cd + export -> verify -> close.
-	status, body = mcpCall(t, ctx, mcpTS.URL+"/mcp/e2e-node-01", adminTok, map[string]any{
+	status, body = mcpCall(t, ctx, mcpTS.URL+"/mcp/e2e-node-01", credentials.Bearer, map[string]any{
 		"jsonrpc": "2.0", "id": 3, "method": "tools/call",
 		"params": map[string]any{"name": "shell_session", "arguments": map[string]any{"action": "open", "workdir": tmpDir}},
 	})
@@ -216,24 +221,24 @@ func TestRealAgentBinaryFullLifecycleAndSelfDestruct(t *testing.T) {
 	endIdx := strings.Index(rest, `\"`)
 	sessionID := rest[:endIdx]
 
-	_, _ = mcpCall(t, ctx, mcpTS.URL+"/mcp/e2e-node-01", adminTok, map[string]any{
+	_, _ = mcpCall(t, ctx, mcpTS.URL+"/mcp/e2e-node-01", credentials.Bearer, map[string]any{
 		"jsonrpc": "2.0", "id": 4, "method": "tools/call",
 		"params": map[string]any{"name": "shell_session", "arguments": map[string]any{"action": "run", "session_id": sessionID, "command": "export E2E_TOKEN_VAL=persisted123"}},
 	})
-	status, body = mcpCall(t, ctx, mcpTS.URL+"/mcp/e2e-node-01", adminTok, map[string]any{
+	status, body = mcpCall(t, ctx, mcpTS.URL+"/mcp/e2e-node-01", credentials.Bearer, map[string]any{
 		"jsonrpc": "2.0", "id": 5, "method": "tools/call",
 		"params": map[string]any{"name": "shell_session", "arguments": map[string]any{"action": "run", "session_id": sessionID, "command": `echo "$E2E_TOKEN_VAL"`}},
 	})
 	if status != http.StatusOK || !strings.Contains(body, "persisted123") {
 		t.Fatalf("shell_session did not persist env var: status=%d body=%s", status, body)
 	}
-	_, _ = mcpCall(t, ctx, mcpTS.URL+"/mcp/e2e-node-01", adminTok, map[string]any{
+	_, _ = mcpCall(t, ctx, mcpTS.URL+"/mcp/e2e-node-01", credentials.Bearer, map[string]any{
 		"jsonrpc": "2.0", "id": 6, "method": "tools/call",
 		"params": map[string]any{"name": "shell_session", "arguments": map[string]any{"action": "close", "session_id": sessionID}},
 	})
 
 	// 4. Trigger remote self-destruct via Admin API -> agent exits and removes its binary!
-	req, _ := http.NewRequest(http.MethodPost, mcpTS.URL+"/admin/targets/e2e-node-01/shutdown", strings.NewReader(`{"reason":"e2e done","self_destruct":true}`))
+	req, _ := http.NewRequest(http.MethodPost, mcpTS.URL+"/admin/channels/e2e/targets/e2e-node-01/shutdown", strings.NewReader(`{"reason":"e2e done","self_destruct":true}`))
 	req.Header.Set("Authorization", "Bearer "+adminTok)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
@@ -261,10 +266,11 @@ func TestRealAgentBinaryFullLifecycleAndSelfDestruct(t *testing.T) {
 	// 5. Verify --ttl auto-exit with a second binary copy.
 	agentCopy2 := filepath.Join(tmpDir, "revmcp-agent-ttl")
 	copyBinary(t, agentBin, agentCopy2)
-	enrollTok2, _, _ := signer.Issue("e2e-ttl-node", proto.ModeReadOnly, time.Hour)
+	ttlCredentials := issue("ttl", "e2e-ttl-node", proto.ModeReadOnly)
 	ttlCmd := exec.Command(agentCopy2,
 		"--hub", wsURL,
-		"--token", enrollTok2,
+		"--token", ttlCredentials.Enrollment,
+		"--target-id", "e2e-ttl-node",
 		"--mode", "readonly",
 		"--ttl", "300ms",
 		"--self-destruct-on-exit",

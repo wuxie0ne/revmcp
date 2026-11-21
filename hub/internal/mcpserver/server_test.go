@@ -3,16 +3,17 @@ package mcpserver
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	hubauth "github.com/revmcp/revmcp/hub/internal/auth"
-	"github.com/revmcp/revmcp/hub/internal/config"
+	"github.com/revmcp/revmcp/hub/internal/channel"
 	"github.com/revmcp/revmcp/hub/internal/policy"
 	"github.com/revmcp/revmcp/hub/internal/registry"
 	"github.com/revmcp/revmcp/proto"
@@ -33,29 +34,17 @@ func (f *fakeCaller) Close() error { return nil }
 func TestMCPBearerAuthAndListTargets(t *testing.T) {
 	t.Parallel()
 
-	rawToken := "test-bearer-token-123"
-	sum := sha256.Sum256([]byte(rawToken))
-	verifier, err := hubauth.NewStaticBearerVerifier([]config.ClientConfig{
-		{
-			Name:           "ops-alice",
-			TokenSHA256:    hex.EncodeToString(sum[:]),
-			Scopes:         []string{policy.ScopeRead},
-			AllowedTargets: []string{"prod-*"},
-		},
-	})
-	if err != nil {
-		t.Fatalf("NewStaticBearerVerifier failed: %v", err)
-	}
-
+	store, credentials := issueMCPTestChannel(t, []string{policy.ScopeRead})
+	rawToken := credentials.Bearer
 	reg := registry.New()
-	reg.Register(proto.AgentInfo{TargetID: "prod-web-01", Hostname: "prod-web-01", Mode: proto.ModeReadOnly}, &fakeCaller{})
-	reg.Register(proto.AgentInfo{TargetID: "dev-box-01", Hostname: "dev-box-01", Mode: proto.ModeFull}, &fakeCaller{})
+	addTestTarget(t, reg, credentials.ChannelID, proto.AgentInfo{TargetID: "prod-web-01", Hostname: "prod-web-01", Mode: proto.ModeReadOnly})
+	addTestTarget(t, reg, credentials.ChannelID, proto.AgentInfo{TargetID: "dev-box-01", Hostname: "dev-box-01", Mode: proto.ModeFull})
 
 	var auditBuf bytes.Buffer
 	gw := NewGateway("test", reg, policy.NewAuditLoggerWithWriter(&auditBuf))
 
 	mux := http.NewServeMux()
-	gw.RegisterRoutes(mux, verifier)
+	gw.RegisterRoutes(mux, hubauth.NewChannelBearerVerifier(store))
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
@@ -144,33 +133,67 @@ func postMCP(t *testing.T, url, token, payload string) (int, string) {
 	return resp.StatusCode, buf.String()
 }
 
+func TestMCPClientSessionRejectsCallsAfterBearerExpiry(t *testing.T) {
+	t.Parallel()
+
+	store, err := channel.Open(filepath.Join(t.TempDir(), "channels.json"), "test-mcpserver-agent-key", "test-mcpserver-mcp-key", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	credentials, err := store.Issue("expiry", channel.Policy{
+		Target: "node-1", Mode: proto.ModeReadOnly, AgentTTL: time.Hour, MCPScopes: []string{policy.ScopeRead}, MCPTTL: 3 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	audit := policy.NewAuditLoggerWithWriter(&bytes.Buffer{})
+	NewGateway("test", registry.New(), audit).RegisterRoutes(mux, hubauth.NewChannelBearerVerifier(store))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Header.Set("Authorization", "Bearer "+credentials.Bearer)
+		mux.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := mcp.NewClient(&mcp.Implementation{Name: "expiry-test", Version: "1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{
+		Endpoint: server.URL + "/mcp", DisableStandaloneSSE: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = session.Close() }()
+
+	params := &mcp.CallToolParams{Name: "list_targets"}
+	if result, err := session.CallTool(ctx, params); err != nil || result.IsError {
+		t.Fatalf("valid Bearer should permit calls, got %v, %v", result, err)
+	}
+
+	time.Sleep(time.Until(credentials.MCPExpires))
+	if _, err := session.CallTool(ctx, params); err == nil || !strings.Contains(err.Error(), http.StatusText(http.StatusUnauthorized)) {
+		t.Fatalf("existing MCP client must receive HTTP 401 after Bearer expiry, got %v", err)
+	}
+}
+
 func TestIsolatedSchemaDefenseInDepthAndRateLimit(t *testing.T) {
 	t.Parallel()
 
-	restrictedTok := "restricted-caller-tok"
-	restrictedSum := sha256.Sum256([]byte(restrictedTok))
-	verifier, err := hubauth.NewStaticBearerVerifier([]config.ClientConfig{
-		{
-			Name:           "ops-restricted",
-			TokenSHA256:    hex.EncodeToString(restrictedSum[:]),
-			Scopes:         []string{policy.ScopeRead, policy.ScopeExecRestricted, policy.ScopeExecSession},
-			AllowedTargets: []string{"prod-*"},
-		},
-	})
-	if err != nil {
-		t.Fatalf("NewStaticBearerVerifier: %v", err)
-	}
-
+	store, credentials := issueMCPTestChannel(t, []string{policy.ScopeRead, policy.ScopeExecRestricted, policy.ScopeExecSession})
+	restrictedTok := credentials.Bearer
 	reg := registry.New()
-	reg.Register(proto.AgentInfo{TargetID: "prod-ro", Mode: proto.ModeReadOnly}, &fakeCaller{})
-	reg.Register(proto.AgentInfo{TargetID: "prod-full", Mode: proto.ModeFull}, &fakeCaller{})
-	reg.Register(proto.AgentInfo{TargetID: "dev-other", Mode: proto.ModeFull}, &fakeCaller{})
+	addTestTarget(t, reg, credentials.ChannelID, proto.AgentInfo{TargetID: "prod-ro", Mode: proto.ModeReadOnly})
+	addTestTarget(t, reg, credentials.ChannelID, proto.AgentInfo{TargetID: "prod-full", Mode: proto.ModeFull})
+	addTestTarget(t, reg, credentials.ChannelID, proto.AgentInfo{TargetID: "dev-other", Mode: proto.ModeFull})
 
 	var auditBuf bytes.Buffer
 	gw := NewGateway("test", reg, policy.NewAuditLoggerWithWriter(&auditBuf))
 
 	mux := http.NewServeMux()
-	gw.RegisterRoutes(mux, verifier)
+	gw.RegisterRoutes(mux, hubauth.NewChannelBearerVerifier(store))
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
@@ -214,4 +237,29 @@ func TestIsolatedSchemaDefenseInDepthAndRateLimit(t *testing.T) {
 	if !strings.Contains(auditBuf.String(), `"reason":"rate limit exceeded`) {
 		t.Fatalf("expected rate limit denial in audit log, got: %s", auditBuf.String())
 	}
+}
+
+func issueMCPTestChannel(t *testing.T, scopes []string) (*channel.Store, channel.Detail) {
+	t.Helper()
+	store, err := channel.Open(filepath.Join(t.TempDir(), "channels.json"), "test-mcpserver-agent-key", "test-mcpserver-mcp-key", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	detail, err := store.Issue("ops", channel.Policy{
+		Target: "prod-*", Mode: proto.ModeFull, AgentTTL: time.Hour, MCPScopes: scopes, MCPTTL: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store, detail
+}
+
+func addTestTarget(t *testing.T, reg *registry.Registry, channelID string, info proto.AgentInfo) {
+	t.Helper()
+	entry, ok := reg.Reserve(channelID, info, &fakeCaller{}, time.Now().Add(time.Hour))
+	if !ok {
+		t.Fatal("could not reserve test target")
+	}
+	reg.Activate(channelID, info.TargetID, entry.Generation)
 }

@@ -16,7 +16,6 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/hashicorp/yamux"
-	"github.com/revmcp/revmcp/hub/internal/auth"
 	"github.com/revmcp/revmcp/hub/internal/channel"
 	"github.com/revmcp/revmcp/hub/internal/policy"
 	"github.com/revmcp/revmcp/hub/internal/registry"
@@ -31,7 +30,6 @@ const (
 
 // Server accepts outbound WebSocket connections from agents and bridges them into yamux sessions.
 type Server struct {
-	signer      *auth.EnrollmentSigner
 	channels    *channel.Store
 	registry    *registry.Registry
 	audit       *policy.AuditLogger
@@ -41,7 +39,7 @@ type Server struct {
 }
 
 // NewServer constructs a southbound tunnel server.
-func NewServer(signer *auth.EnrollmentSigner, reg *registry.Registry, audit *policy.AuditLogger, hubVersion string, maxInflight int, logger *slog.Logger) *Server {
+func NewServer(store *channel.Store, reg *registry.Registry, audit *policy.AuditLogger, hubVersion string, maxInflight int, logger *slog.Logger) *Server {
 	if maxInflight <= 0 {
 		maxInflight = 16
 	}
@@ -49,7 +47,7 @@ func NewServer(signer *auth.EnrollmentSigner, reg *registry.Registry, audit *pol
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	return &Server{
-		signer:      signer,
+		channels:    store,
 		registry:    reg,
 		audit:       audit,
 		hubVersion:  hubVersion,
@@ -58,25 +56,11 @@ func NewServer(signer *auth.EnrollmentSigner, reg *registry.Registry, audit *pol
 	}
 }
 
-func (s *Server) UseChannels(store *channel.Store) { s.channels = store }
-
-func (s *Server) authorize(token string) error {
-	if !channel.Managed(token) {
-		_, err := s.signer.Verify(token)
-		return err
-	}
-	if s.channels == nil {
-		return channel.ErrDenied
-	}
-	_, _, err := s.channels.Verify(token, channel.Agent)
-	return err
-}
-
 // ServeHTTP upgrades an authenticated agent WebSocket connection, performs registration,
 // and keeps the tunnel registered until the session closes.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	token := extractBearer(r.Header.Get("Authorization"))
-	if err := s.authorize(token); err != nil {
+	if _, _, err := s.channels.Verify(token, channel.Agent); err != nil {
 		http.Error(w, "unauthorized enrollment token", http.StatusUnauthorized)
 		return
 	}
@@ -212,27 +196,13 @@ func (s *Server) handleRegister(session *yamux.Session, caller *sessionCaller, t
 }
 
 func (s *Server) register(token string, req proto.RegisterRequest, caller *sessionCaller, reply func() error) (*registry.Entry, string, error) {
-	if !channel.Managed(token) {
-		mode, err := proto.ParseMode(string(req.Agent.Mode))
-		if err != nil {
-			return nil, "", &proto.RPCError{Code: proto.ErrCodeModeDenied, Message: "invalid Agent mode"}
-		}
-		info := req.Agent
-		info.Mode = mode
-		entry, err := s.registerLegacy(token, info, caller, reply)
-		return entry, "", err
-	}
-	if s.channels == nil {
-		return nil, "", channel.ErrDenied
-	}
-
 	start := time.Now()
 	info := req.Agent
 	var entry *registry.Entry
 	channelID, err := s.channels.AdmitAgent(token, func(record channel.Record) error {
 		matches, _ := path.Match(record.Policy.Target, info.TargetID)
-		if !req.TargetIDExplicit || !channel.ValidName(info.TargetID) || !matches {
-			return &proto.RPCError{Code: proto.ErrCodeInvalidArgument, Message: "explicit target ID matching the channel target rule is required"}
+		if !channel.ValidName(info.TargetID) || !matches {
+			return &proto.RPCError{Code: proto.ErrCodeInvalidArgument, Message: "target ID matching the channel target rule is required"}
 		}
 		mode, err := proto.ParseMode(string(info.Mode))
 		if err != nil || !record.Policy.Mode.Allows(mode) {
@@ -240,7 +210,7 @@ func (s *Server) register(token string, req proto.RegisterRequest, caller *sessi
 		}
 		info.Mode = mode
 		var reserved bool
-		entry, reserved = s.registry.Reserve(record.ID, info, caller)
+		entry, reserved = s.registry.Reserve(record.ID, info, caller, time.Unix(record.Agent.Expires, 0))
 		if !reserved {
 			return &proto.RPCError{Code: proto.ErrCodeInvalidArgument, Message: "target already connected in channel"}
 		}
@@ -265,38 +235,6 @@ func (s *Server) register(token string, req proto.RegisterRequest, caller *sessi
 	}
 	s.auditRegistration(channelID, targetID, decision, reason, time.Since(start))
 	return entry, channelID, err
-}
-
-func (s *Server) registerLegacy(token string, info proto.AgentInfo, caller *sessionCaller, reply func() error) (*registry.Entry, error) {
-	claims, err := s.signer.Verify(token)
-	if err != nil {
-		return nil, err
-	}
-	if !claims.MaxMode.Allows(info.Mode) {
-		return nil, &proto.RPCError{Code: proto.ErrCodeModeDenied, Message: "agent mode exceeds enrollment token max_mode"}
-	}
-	info.TargetID = claims.TargetID
-	if err := reply(); err != nil {
-		return nil, err
-	}
-	entry, replaced := s.registry.Register(info, caller)
-	if replaced != nil {
-		if replaced.Info.InstanceID != "" && info.InstanceID != "" && replaced.Info.InstanceID != info.InstanceID {
-			if s.audit != nil {
-				_ = s.audit.Log(policy.AuditEntry{
-					TraceID: newRequestID(), User: "agent:" + info.TargetID, TargetID: info.TargetID,
-					Tool: "agent.register.takeover", Decision: "allow",
-					Reason: "high_severity_takeover: different instance_id replaced active target connection",
-					ArgsRedacted: map[string]any{
-						"old_instance_id": replaced.Info.InstanceID, "new_instance_id": info.InstanceID,
-						"jti": claims.JTI, "mode": string(info.Mode),
-					},
-				})
-			}
-		}
-		_ = replaced.Caller.Close()
-	}
-	return entry, nil
 }
 
 func (s *Server) auditRegistration(channelID, targetID, decision, reason string, duration time.Duration) {

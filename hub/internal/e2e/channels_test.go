@@ -32,41 +32,26 @@ func TestManagedChannelLifecycle(t *testing.T) {
 		t.Skip("run make test-e2e with the current Agent binary")
 	}
 	const adminToken = "test-managed-admin-token"
-	const otherAdmin = "test-nondesignated-admin-token"
+	const otherAdmin = "test-unconfigured-bearer"
 	const agentKey = "test-managed-agent-secret"
 	sum := sha256.Sum256([]byte(adminToken))
-	otherSum := sha256.Sum256([]byte(otherAdmin))
-	cfg := &config.Config{
-		Management: config.ManagementConfig{AdminClient: "issuer"},
-		Tokens:     &config.ChannelsConfig{},
-		Clients: []config.ClientConfig{{
-			Name: "issuer", TokenSHA256: hex.EncodeToString(sum[:]), Scopes: []string{"admin"}, AllowedTargets: []string{"*"},
-		}, {
-			Name: "other", TokenSHA256: hex.EncodeToString(otherSum[:]), Scopes: []string{"admin"}, AllowedTargets: []string{"*"},
-		}},
-	}
 	store, err := channel.Open(filepath.Join(t.TempDir(), "channels.json"), agentKey, "test-managed-mcp-secret", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = store.Close() }()
-	static, err := hubauth.NewStaticBearerVerifier(cfg.Clients)
-	if err != nil {
-		t.Fatal(err)
-	}
-	legacy, err := hubauth.NewEnrollmentSigner(agentKey)
+	verifier, err := hubauth.NewAdminBearerVerifier(hex.EncodeToString(sum[:]))
 	if err != nil {
 		t.Fatal(err)
 	}
 	reg := registry.New()
 	var auditLog syncBuffer
 	audit := policy.NewAuditLoggerWithWriter(&auditLog)
-	tunnelServer := tunnel.NewServer(legacy, reg, audit, "test", 8, nil)
-	tunnelServer.UseChannels(store)
+	tunnelServer := tunnel.NewServer(store, reg, audit, "test", 8, nil)
 	mux := http.NewServeMux()
 	mux.Handle("/agent/ws", tunnelServer)
-	mcpserver.NewGateway("test", reg, audit).RegisterRoutes(mux, hubauth.WithChannelBearer(store, static))
-	admin.NewHandler(reg, legacy, audit).RegisterChannelRoutes(mux, static, cfg, store)
+	mcpserver.NewGateway("test", reg, audit).RegisterRoutes(mux, hubauth.NewChannelBearerVerifier(store))
+	admin.NewHandler(reg, store, audit).RegisterRoutes(mux, verifier, config.ChannelsConfig{})
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
@@ -113,8 +98,8 @@ func TestManagedChannelLifecycle(t *testing.T) {
 	issue.Name = "b"
 	adminAPI(http.MethodPost, "", issue, http.StatusCreated, &b)
 	api(http.MethodPost, "/admin/channels/a/reveal", a.Bearer, nil, http.StatusUnauthorized, nil)
-	api(http.MethodGet, "/admin/channels", otherAdmin, nil, http.StatusForbidden, nil)
-	api(http.MethodPost, "/admin/channels/a/reveal", otherAdmin, nil, http.StatusForbidden, nil)
+	api(http.MethodGet, "/admin/channels", otherAdmin, nil, http.StatusUnauthorized, nil)
+	api(http.MethodPost, "/admin/channels/a/reveal", otherAdmin, nil, http.StatusUnauthorized, nil)
 	var revealed channel.Detail
 	adminAPI(http.MethodPost, "/a/reveal", nil, http.StatusOK, &revealed)
 	if revealed.Enrollment != a.Enrollment || revealed.Bearer != a.Bearer {
@@ -164,8 +149,8 @@ func TestManagedChannelLifecycle(t *testing.T) {
 	wrongMode := start(a.Enrollment, "wrong-mode", "node-3", "--mode", "restricted")
 	eventually(func() bool {
 		return strings.Contains(dupe.String(), "target already connected") &&
-			strings.Contains(implicit.String(), "explicit target ID matching") &&
-			strings.Contains(wrongTarget.String(), "explicit target ID matching") &&
+			strings.Contains(implicit.String(), "--target-id are required") &&
+			strings.Contains(wrongTarget.String(), "target ID matching") &&
 			strings.Contains(wrongMode.String(), "mode exceeds channel maximum")
 	})
 	if entry, _ := reg.GetIn(idA, "node-1"); entry == nil || entry.Info.Tags["marker"] != "channel-a-marker" {
@@ -186,6 +171,11 @@ func TestManagedChannelLifecycle(t *testing.T) {
 			"jsonrpc": "2.0", "id": 1, "method": "tools/call",
 			"params": map[string]any{"name": tool, "arguments": args},
 		})
+	}
+	for _, bearer := range []string{adminToken, otherAdmin, a.Enrollment} {
+		if code, _ := call("/mcp", bearer, "list_targets", map[string]any{}); code != http.StatusUnauthorized {
+			t.Fatal("MCP accepted a non-MCP credential")
+		}
 	}
 	status, result := call("/mcp", a.Bearer, "list_targets", map[string]any{})
 	if status != http.StatusOK || !strings.Contains(result, "channel-a-marker") || strings.Contains(result, "channel-b-marker") {
@@ -227,6 +217,47 @@ func TestManagedChannelLifecycle(t *testing.T) {
 	if len(reg.ListIn(idA, "", "")) != 0 || len(reg.ListIn(idB, "", "")) != 1 {
 		t.Fatal("delete did not detach exactly the named channel")
 	}
+
+	const expiredShutdown = "/admin/targets/expired/shutdown"
+	var batch admin.ExpiredShutdownResult
+	api(http.MethodPost, expiredShutdown, b.Bearer, nil, http.StatusUnauthorized, nil)
+	api(http.MethodPost, expiredShutdown, adminToken, admin.ShutdownPayload{SelfDestruct: true}, http.StatusBadRequest, nil)
+	api(http.MethodPost, expiredShutdown, adminToken, nil, http.StatusOK, &batch)
+	if batch.Failed != 0 || len(batch.Targets) != 0 {
+		t.Fatalf("unexpected shutdown targets before expiry: %+v", batch)
+	}
+
+	var short channel.Detail
+	adminAPI(http.MethodPost, "", admin.IssueChannel{Name: "short", Policy: config.IssuePolicy{
+		Target: "node-*", AgentTTL: 4 * time.Second,
+	}}, http.StatusCreated, &short)
+	idShort, _ := store.ID("short")
+	start(short.Enrollment, "expiring", "node-1")
+	eventually(func() bool {
+		_, ok := reg.GetIn(idShort, "node-1")
+		return ok
+	})
+	time.Sleep(time.Until(short.AgentExpires))
+	var replacement channel.Detail
+	adminAPI(http.MethodPost, "/short/rotate/agent", nil, http.StatusOK, &replacement)
+	start(replacement.Enrollment, "fresh", "node-2")
+	eventually(func() bool {
+		_, ok := reg.GetIn(idShort, "node-2")
+		return ok
+	})
+	api(http.MethodPost, expiredShutdown, adminToken, nil, http.StatusOK, &batch)
+	if batch.Failed != 0 || len(batch.Targets) != 1 || !batch.Targets[0].Accepted ||
+		batch.Targets[0].ChannelID != idShort || batch.Targets[0].TargetID != "node-1" {
+		t.Fatalf("unexpected expired shutdown results: %+v", batch)
+	}
+	eventually(func() bool {
+		_, ok := reg.GetIn(idShort, "node-1")
+		return !ok
+	})
+	if _, ok := reg.GetIn(idShort, "node-2"); !ok || len(reg.ListIn(idB, "", "")) != 1 {
+		t.Fatal("bulk shutdown affected an Agent with an unexpired credential")
+	}
+
 	log := auditLog.String()
 	seen := make(map[string]bool)
 	for line := range strings.SplitSeq(log, "\n") {

@@ -108,7 +108,6 @@ func (e *RPCError) Error() string {
 // AgentInfo describes a connected target host or container.
 type AgentInfo struct {
 	TargetID    string            `json:"target_id"`
-	InstanceID  string            `json:"instance_id,omitempty"`
 	Hostname    string            `json:"hostname"`
 	OS          string            `json:"os"`
 	Kernel      string            `json:"kernel"`
@@ -122,9 +121,8 @@ type AgentInfo struct {
 
 // RegisterRequest is sent on the initial agent->hub stream after WebSocket upgrade.
 type RegisterRequest struct {
-	ProtoVersion     int       `json:"proto_version"`
-	Agent            AgentInfo `json:"agent"`
-	TargetIDExplicit bool      `json:"target_id_explicit,omitempty"`
+	ProtoVersion int       `json:"proto_version"`
+	Agent        AgentInfo `json:"agent"`
 }
 
 // RegisterResponse acknowledges registration on the initial stream.

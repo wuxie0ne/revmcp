@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -14,7 +15,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/hashicorp/yamux"
-	"github.com/revmcp/revmcp/hub/internal/auth"
+	"github.com/revmcp/revmcp/hub/internal/channel"
 	"github.com/revmcp/revmcp/hub/internal/policy"
 	"github.com/revmcp/revmcp/hub/internal/registry"
 	"github.com/revmcp/revmcp/proto"
@@ -127,14 +128,15 @@ func (s *syncBuffer) String() string {
 func TestHubTunnelRoundTripTraceAndCancel(t *testing.T) {
 	t.Parallel()
 
-	signer, err := auth.NewEnrollmentSigner("hub-tunnel-test-secret-key-12345")
+	store, err := channel.Open(filepath.Join(t.TempDir(), "channels.json"), "test-tunnel-agent-key", "test-tunnel-mcp-key", false)
 	if err != nil {
-		t.Fatalf("NewEnrollmentSigner: %v", err)
+		t.Fatal(err)
 	}
+	defer func() { _ = store.Close() }()
 	reg := registry.New()
 	var auditBuf syncBuffer
 	audit := policy.NewAuditLoggerWithWriter(&auditBuf)
-	srv := NewServer(signer, reg, audit, "test", 8, nil)
+	srv := NewServer(store, reg, audit, "test", 8, nil)
 
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
@@ -145,23 +147,37 @@ func TestHubTunnelRoundTripTraceAndCancel(t *testing.T) {
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}
-	if err == nil || (resp != nil && resp.StatusCode != http.StatusUnauthorized) {
+	if err == nil || (resp == nil || resp.StatusCode != http.StatusUnauthorized) {
 		t.Fatalf("expected 401 unauthorized on missing token, err=%v resp=%v", err, resp)
 	}
 
 	// 2. Valid token registration + TraceID propagation + cascade cancel.
-	tok, _, err := signer.Issue("prod-01", proto.ModeRestricted, time.Hour)
+	credentials, err := store.Issue("prod", channel.Policy{
+		Target: "prod-01", Mode: proto.ModeRestricted, AgentTTL: time.Hour, MCPScopes: []string{"read"}, MCPTTL: time.Hour,
+	})
 	if err != nil {
 		t.Fatalf("Issue token: %v", err)
+	}
+
+	// A token outside the channel format and a channel token for MCP are both rejected.
+	for _, token := range []string{"old-enrollment-format", credentials.Bearer} {
+		_, resp, err := websocket.Dial(context.Background(), wsURL, &websocket.DialOptions{
+			HTTPHeader: http.Header{"Authorization": []string{"Bearer " + token}},
+		})
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if err == nil || resp == nil || resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for unsupported token, err=%v resp=%v", err, resp)
+		}
 	}
 
 	gotTraceCh := make(chan string, 1)
 	canceledCh := make(chan struct{}, 1)
 
-	_, cleanup := dialTestAgent(t, wsURL, tok, proto.AgentInfo{
-		TargetID:   "prod-01",
-		InstanceID: "inst-1",
-		Mode:       proto.ModeRestricted,
+	_, cleanup := dialTestAgent(t, wsURL, credentials.Enrollment, proto.AgentInfo{
+		TargetID: "prod-01",
+		Mode:     proto.ModeRestricted,
 	}, func(ctx context.Context, req proto.Request) (any, *proto.RPCError) {
 		if req.Method == proto.MethodSysInfo {
 			gotTraceCh <- req.TraceID
@@ -180,7 +196,7 @@ func TestHubTunnelRoundTripTraceAndCancel(t *testing.T) {
 	var entry *registry.Entry
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if e, ok := reg.Get("prod-01"); ok {
+		if e, ok := reg.GetIn(credentials.ChannelID, "prod-01"); ok {
 			entry = e
 			break
 		}
@@ -214,40 +230,16 @@ func TestHubTunnelRoundTripTraceAndCancel(t *testing.T) {
 		t.Fatal("expected remote agent handler to cancel promptly")
 	}
 
-	// 3. Different instance_id taking over active target must emit high-severity audit warning.
-	_, cleanup2 := dialTestAgent(t, wsURL, tok, proto.AgentInfo{
-		TargetID:   "prod-01",
-		InstanceID: "inst-2-intruder",
-		Mode:       proto.ModeRestricted,
-	}, func(_ context.Context, _ proto.Request) (any, *proto.RPCError) {
-		return &proto.PingResult{}, nil
-	})
-	defer cleanup2()
-
-	deadline = time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if strings.Contains(auditBuf.String(), "agent.register.takeover") {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+	if _, err := store.Change("prod", channel.Agent, false); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(auditBuf.String(), "agent.register.takeover") || !strings.Contains(auditBuf.String(), "inst-2-intruder") {
-		t.Fatalf("expected high-severity takeover audit entry, got: %s", auditBuf.String())
-	}
-
-	// 4. Revoked JTI must be rejected with 401 on subsequent dial.
-	claims, err := signer.Verify(tok)
-	if err != nil {
-		t.Fatalf("Verify tok: %v", err)
-	}
-	signer.Revoke(claims.JTI)
 	_, respRevoked, err := websocket.Dial(context.Background(), wsURL, &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + tok}},
+		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + credentials.Enrollment}},
 	})
 	if respRevoked != nil && respRevoked.Body != nil {
 		_ = respRevoked.Body.Close()
 	}
-	if err == nil || (respRevoked != nil && respRevoked.StatusCode != http.StatusUnauthorized) {
+	if err == nil || (respRevoked == nil || respRevoked.StatusCode != http.StatusUnauthorized) {
 		t.Fatalf("expected 401 for revoked token, err=%v resp=%v", err, respRevoked)
 	}
 }

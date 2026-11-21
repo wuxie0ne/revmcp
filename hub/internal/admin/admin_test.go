@@ -6,12 +6,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	hubauth "github.com/revmcp/revmcp/hub/internal/auth"
+	"github.com/revmcp/revmcp/hub/internal/channel"
 	"github.com/revmcp/revmcp/hub/internal/config"
 	"github.com/revmcp/revmcp/hub/internal/policy"
 	"github.com/revmcp/revmcp/hub/internal/registry"
@@ -20,9 +24,13 @@ import (
 
 type mockShutdownCaller struct {
 	lastReq proto.ShutdownRequest
+	err     error
 }
 
 func (m *mockShutdownCaller) Call(_ context.Context, method string, params any, dst any) error {
+	if m.err != nil {
+		return m.err
+	}
 	if method == proto.MethodAgentShutdown {
 		if req, ok := params.(proto.ShutdownRequest); ok {
 			m.lastReq = req
@@ -35,102 +43,96 @@ func (m *mockShutdownCaller) Call(_ context.Context, method string, params any, 
 
 func (m *mockShutdownCaller) Close() error { return nil }
 
-func TestAdminEndpointsAuthShutdownAndRevoke(t *testing.T) {
+func TestChannelAdminShutdown(t *testing.T) {
 	t.Parallel()
 
-	adminTok := "admin-secret-token"
-	readTok := "readonly-secret-token"
-	adminSum := sha256.Sum256([]byte(adminTok))
-	readSum := sha256.Sum256([]byte(readTok))
-
-	verifier, err := hubauth.NewStaticBearerVerifier([]config.ClientConfig{
-		{
-			Name:           "sre-admin",
-			TokenSHA256:    hex.EncodeToString(adminSum[:]),
-			Scopes:         []string{policy.ScopeRead, policy.ScopeAdmin},
-			AllowedTargets: []string{"prod-*"},
-		},
-		{
-			Name:           "ops-reader",
-			TokenSHA256:    hex.EncodeToString(readSum[:]),
-			Scopes:         []string{policy.ScopeRead},
-			AllowedTargets: []string{"*"},
-		},
-	})
+	const token = "admin-secret-token"
+	digest := sha256.Sum256([]byte(token))
+	verifier, err := hubauth.NewAdminBearerVerifier(hex.EncodeToString(digest[:]))
 	if err != nil {
-		t.Fatalf("NewStaticBearerVerifier: %v", err)
+		t.Fatal(err)
 	}
-
-	signer, err := hubauth.NewEnrollmentSigner("admin-test-signing-secret-123456")
+	store, err := channel.Open(filepath.Join(t.TempDir(), "channels.json"), "test-admin-agent-key", "test-admin-mcp-key", false)
 	if err != nil {
-		t.Fatalf("NewEnrollmentSigner: %v", err)
+		t.Fatal(err)
 	}
+	defer func() { _ = store.Close() }()
 
+	policies := config.ChannelsConfig{}
+	issuance, err := policies.Resolve("", config.IssuePolicy{Target: "prod-01"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	detail, err := store.Issue("prod", issuance)
+	if err != nil {
+		t.Fatal(err)
+	}
 	reg := registry.New()
 	caller := &mockShutdownCaller{}
-	reg.Register(proto.AgentInfo{TargetID: "prod-01", Hostname: "prod-01", Mode: proto.ModeReadOnly}, caller)
-	reg.Register(proto.AgentInfo{TargetID: "dev-01", Hostname: "dev-01", Mode: proto.ModeFull}, &mockShutdownCaller{})
+	entry, ok := reg.Reserve(detail.ChannelID, proto.AgentInfo{TargetID: "prod-01", Mode: proto.ModeReadOnly}, caller, detail.AgentExpires)
+	if !ok {
+		t.Fatal("could not reserve test target")
+	}
+	reg.Activate(detail.ChannelID, "prod-01", entry.Generation)
 
 	var auditBuf bytes.Buffer
-	h := NewHandler(reg, signer, policy.NewAuditLoggerWithWriter(&auditBuf))
-
 	mux := http.NewServeMux()
-	h.RegisterRoutes(mux, verifier)
-	ts := httptest.NewServer(mux)
-	defer ts.Close()
+	NewHandler(reg, store, policy.NewAuditLoggerWithWriter(&auditBuf)).RegisterRoutes(mux, verifier, policies)
 
-	// 1. Non-admin caller must receive 403 Forbidden.
-	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/targets", nil)
-	req.Header.Set("Authorization", "Bearer "+readTok)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("GET /admin/targets as reader: %v", err)
+	for _, tc := range []struct {
+		path   string
+		bearer string
+		status int
+	}{
+		{"/admin/channels/prod/targets/prod-01/shutdown", detail.Bearer, http.StatusUnauthorized},
+		{"/admin/targets/prod-01/shutdown", token, http.StatusNotFound},
+		{"/admin/tokens/revoke", token, http.StatusNotFound},
+		{"/admin/channels/prod/targets/prod-01/shutdown", token, http.StatusOK},
+	} {
+		req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(`{"reason":"maintenance","self_destruct":true}`))
+		req.Header.Set("Authorization", "Bearer "+tc.bearer)
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, req)
+		if response.Code != tc.status {
+			t.Fatalf("%s: got %d, want %d", tc.path, response.Code, tc.status)
+		}
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("expected 403 for non-admin scope, got %d", resp.StatusCode)
-	}
-
-	// 2. Admin lists targets filtered by allowed_targets (prod-* only).
-	req, _ = http.NewRequest(http.MethodGet, ts.URL+"/admin/targets", nil)
-	req.Header.Set("Authorization", "Bearer "+adminTok)
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("GET /admin/targets as admin: %v", err)
-	}
-	var listBody bytes.Buffer
-	_, _ = listBody.ReadFrom(resp.Body)
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || !strings.Contains(listBody.String(), "prod-01") || strings.Contains(listBody.String(), "dev-01") {
-		t.Fatalf("unexpected admin targets list: status=%d body=%s", resp.StatusCode, listBody.String())
-	}
-
-	// 3. Admin triggers remote self-destruct shutdown on prod-01.
-	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/admin/targets/prod-01/shutdown", strings.NewReader(`{"reason":"maintenance","self_destruct":true}`))
-	req.Header.Set("Authorization", "Bearer "+adminTok)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("POST shutdown: %v", err)
-	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || !caller.lastReq.SelfDestruct || caller.lastReq.Reason != "maintenance" {
-		t.Fatalf("unexpected shutdown result: status=%d req=%+v", resp.StatusCode, caller.lastReq)
+	if !caller.lastReq.SelfDestruct || caller.lastReq.Reason != "maintenance" {
+		t.Fatalf("unexpected shutdown request: %+v", caller.lastReq)
 	}
 	if !strings.Contains(auditBuf.String(), `"tool":"admin.shutdown"`) {
 		t.Fatalf("expected admin.shutdown audit entry, got: %s", auditBuf.String())
 	}
 
-	// 4. Admin revokes an enrollment token JTI.
-	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/admin/tokens/revoke", strings.NewReader(`{"jti":"deadbeef12345678"}`))
-	req.Header.Set("Authorization", "Bearer "+adminTok)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("POST revoke: %v", err)
+	for _, tc := range []struct {
+		targetID string
+		pending  bool
+		err      error
+	}{
+		{targetID: "expired-ok"},
+		{targetID: "expired-failed", err: errors.New("Agent unreachable")},
+		{targetID: "pending", pending: true},
+	} {
+		entry, ok := reg.Reserve(detail.ChannelID, proto.AgentInfo{TargetID: tc.targetID},
+			&mockShutdownCaller{err: tc.err}, time.Now().Add(-time.Second))
+		if !ok {
+			t.Fatal("could not reserve expired target")
+		}
+		if !tc.pending {
+			reg.Activate(detail.ChannelID, tc.targetID, entry.Generation)
+		}
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || !signer.IsRevoked("deadbeef12345678") {
-		t.Fatalf("expected jti to be revoked, status=%d", resp.StatusCode)
+	req := httptest.NewRequest(http.MethodPost, "/admin/targets/expired/shutdown", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, req)
+	var batch ExpiredShutdownResult
+	if err := json.Unmarshal(response.Body.Bytes(), &batch); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusOK || batch.Failed != 1 || len(batch.Targets) != 2 ||
+		batch.Targets[0].TargetID != "expired-failed" || batch.Targets[0].Accepted || batch.Targets[0].Error != "Agent unreachable" ||
+		batch.Targets[1].TargetID != "expired-ok" || !batch.Targets[1].Accepted {
+		t.Fatalf("unexpected bulk response: status=%d result=%+v", response.Code, batch)
 	}
 }

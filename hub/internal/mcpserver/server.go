@@ -66,9 +66,7 @@ func (g *Gateway) checkRateLimit(info *sdkauth.TokenInfo, targetID string) error
 
 // RegisterRoutes mounts /mcp and /mcp/{target_id} behind auth.RequireBearerToken.
 func (g *Gateway) RegisterRoutes(mux *http.ServeMux, verifier sdkauth.TokenVerifier) {
-	authMW := sdkauth.RequireBearerToken(verifier, &sdkauth.RequireBearerTokenOptions{
-		AllowMissingExpiration: true,
-	})
+	authMW := sdkauth.RequireBearerToken(verifier, nil)
 
 	opts := &mcp.StreamableHTTPOptions{
 		Stateless:    true,
