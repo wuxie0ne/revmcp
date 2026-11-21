@@ -194,7 +194,7 @@ Hub 可从签发元数据和签名密钥重现原凭证。列表默认隐藏原�
 
 ## 版本发布
 
-[Release 工作流](.github/workflows/release.yml)收到 `vMAJOR.MINOR.PATCH` 标签后，使用仓库固定的 mise 工具链运行测试、真实 Agent 端到端测试、静态检查及静态链接检查，通过后构建并发布 GitHub Release。手动运行工作流可预演同一套检查和打包流程，产物从该次 Actions 运行下载。
+[Release 工作流](.github/workflows/release.yml)收到 `vMAJOR.MINOR.PATCH` 标签后，使用仓库固定的 mise 工具链运行测试、真实 Agent 端到端测试、静态检查及静态链接检查，通过后构建并发布 GitHub Release。手动运行时留空 `release_tag` 即可预演同一套检查和打包流程，产物从该次 Actions 运行下载。
 
 每次正式发布提供三个 `.tar.gz` 归档和 `SHA256SUMS`。
 
@@ -212,3 +212,5 @@ Hub 可从签发元数据和签名密钥重现原凭证。列表默认隐藏原�
 git tag -a v0.1.0 -m "revmcp v0.1.0"
 git push origin refs/tags/v0.1.0
 ```
+
+如果标签已推送而发布尚未成功，可在默认分支手动运行 **Release**，把现有标签填入 `release_tag`。工作流会使用默认分支的发布定义重新构建该标签指向的提交，发布前再次校验远端标签指向。

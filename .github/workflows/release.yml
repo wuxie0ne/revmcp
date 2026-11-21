@@ -4,11 +4,16 @@ on:
   push:
     tags: ['v*.*.*']
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to retry. Leave empty to preview.
+        type: string
+        required: false
 
 permissions: {}
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -22,26 +27,41 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       commit: ${{ steps.version.outputs.commit }}
     steps:
+      - name: Select source ref
+        id: source
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          ref=$GITHUB_SHA
+          if [[ -n $TAG ]]; then
+            if [[ ! $TAG =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "Expected a stable version tag such as v0.1.0." >&2
+              exit 1
+            fi
+            if [[ $EVENT == workflow_dispatch ]]; then
+              if [[ $GITHUB_REF != "refs/heads/$DEFAULT_BRANCH" ]]; then
+                echo "Retry a release from the default branch." >&2
+                exit 1
+              fi
+              ref="refs/tags/$TAG"
+            fi
+          fi
+          printf 'ref=%s\ntag=%s\n' "$ref" "$TAG" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ steps.source.outputs.ref }}
           persist-credentials: false
 
       - name: Select package version
         id: version
         env:
-          EVENT: ${{ github.event_name }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ steps.source.outputs.tag }}
         run: |
           commit=$(git rev-parse HEAD)
-          if [[ $EVENT == push ]]; then
-            if [[ ! $TAG =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-              echo "Expected a stable version tag such as v0.1.0." >&2
-              exit 1
-            fi
-            version=$TAG
-          else
-            version="v0.0.0-dev.${commit:0:12}"
-          fi
+          version=${TAG:-"v0.0.0-dev.${commit:0:12}"}
           printf 'version=%s\ncommit=%s\n' "$version" "$commit" >> "$GITHUB_OUTPUT"
 
       - uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
@@ -80,7 +100,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    if: github.event_name == 'push' || inputs.release_tag != ''
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -101,8 +121,13 @@ jobs:
           EXPECTED_COMMIT: ${{ needs.build.outputs.commit }}
         run: |
           sha256sum -c SHA256SUMS
-          tagged_commit=$(gh api "repos/{owner}/{repo}/commits/tags%2F$VERSION" --jq .sha)
-          if [[ $tagged_commit != "$EXPECTED_COMMIT" ]]; then
+          ref=$(gh api "repos/$GH_REPO/git/ref/tags/$VERSION" --jq '.object | [.type, .sha] | @tsv')
+          IFS=$'\t' read -r kind sha <<< "$ref"
+          while [[ $kind == tag ]]; do
+            ref=$(gh api "repos/$GH_REPO/git/tags/$sha" --jq '.object | [.type, .sha] | @tsv')
+            IFS=$'\t' read -r kind sha <<< "$ref"
+          done
+          if [[ $kind != commit || $sha != "$EXPECTED_COMMIT" ]]; then
             echo "The remote tag no longer points at the build commit." >&2
             exit 1
           fi
