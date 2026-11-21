@@ -16,14 +16,15 @@
   - Agent 启动级硬锁 `--mode readonly|restricted|full`（`restricted` 使用 `mvdan.cc/sh/v3` AST 白名单解析，非正则黑名单）；
   - 文件读取拒绝设备/管道文件（防 `/dev/zero` 阻塞），默认内置高危凭据路径黑名单，并支持 `--allow-path` / `--deny-path`（含符号链接穿透检测）；
   - 全链路 JSONL 脱敏审计 + `<remote_output>` 防 Prompt Injection 边界包裹。
-- **临时授权与零残留**：支持 `--ttl` 自动退出、Hub 远程下线/自毁（`--self-destruct` 删除磁盘二进制文件），且管理接口仅通过受 `admin` scope 保护的 HTTP API / CLI 提供，不暴露给 LLM。
+- **临时授权与清理**：Agent 支持 `--ttl` 自动退出，管理员可通过 HTTP API 或 CLI 远程下线目标，也可在单目标下线时要求删除 Agent 可执行文件。
 
-## 架构与文档
+## 文档索引
 
-- [需求文档（PRD）](docs/prd.md)
-- [系统与详细设计文档](docs/design.md)
-- [实现与部署计划](docs/implementation-plan.md)
-- [AI 协作规范](AGENTS.md)
+- [需求与范围（PRD）](docs/prd.md)
+- [架构、接口与安全设计](docs/design.md)
+- [阶段交付与验收](docs/implementation-plan.md)
+- [开发协作与提交前文档规则](AGENTS.md)
+- [版本发布](#版本发布)和 [MIT 许可证](LICENSE)
 
 ## 快速开始
 
@@ -86,7 +87,7 @@ Hub 启动时读取两把签名密钥和 `management.admin_token_sha256` 指定�
   --name mcp-remote-99 --scope read --allowed-target remote-99 --ttl 24h
 ```
 
-`--ttl` 控制 MCP Bearer 的有效期，`--agent-ttl` 控制 Agent 注册 Token 的有效期，`--mode` 控制 Agent 的最高运行模式。
+`--mode` 控制 Agent 的最高运行模式。两种签发有效期及 Agent 运行时限见[凭证与连接的生命周期](#凭证与连接的生命周期)。
 
 ### 4. 在目标机运行 Agent
 
@@ -166,9 +167,17 @@ export REVMCP_ENROLL_TOKEN='<channel-01 的 enrollment_token>'
 ./bin/revmcp-hub channel delete --config hub.channels.local.yaml --name channel-02
 ```
 
-Hub 可从签发元数据和签名密钥重现原凭证。列表默认隐藏原值，`--show-secrets` 只返回仍有效的凭证。Hub 发现签名密钥与状态文件不一致时会拒绝启动。确认换钥时，用新密钥和 `serve --config hub.channels.local.yaml --accept-signing-key-change` 启动一次，永久吊销受影响的渠道凭证，再通过 `token rotate` 签发对应类型的新凭证。单独吊销 Agent 注册 Token 会阻止下次连接；已建立的连接继续在线。
+Hub 可从签发元数据和签名密钥重现原凭证。列表默认隐藏原值，`--show-secrets` 只返回仍有效的凭证。Hub 发现签名密钥与状态文件不一致时会拒绝启动。确认换钥时，用新密钥和 `serve --config hub.channels.local.yaml --accept-signing-key-change` 启动一次，永久吊销受影响的渠道凭证，再通过 `token rotate` 签发对应类型的新凭证。
 
-`target kick --expired` 扫描所有渠道，按各连接注册时使用的凭证到期时间筛选。轮换凭证后，旧连接仍按原到期时间判断。命令返回逐目标结果，任一 Agent 未接受退出请求时返回非零退出码。
+### 凭证与连接的生命周期
+
+| 时限 | 设置方式 | 到期后的行为 |
+| --- | --- | --- |
+| Agent 注册凭证 | `token issue --agent-ttl` | 新连接和重连收到 HTTP 401。已经建立的隧道继续在线。 |
+| MCP Bearer | `token issue --ttl` | 使用该凭证的新 MCP 请求收到 HTTP 401，包括已有 AI 会话发起的请求。 |
+| Agent 运行时限 | 启动 Agent 时设置 `--ttl` | 从进程启动时计时。到期后 Agent 退出，隧道断开。 |
+
+吊销 Agent 注册凭证也会阻止新连接和重连。管理员可用 `target kick` 下线单个在线目标，或用 `target kick --expired` 扫描所有渠道并下线使用已过期注册凭证接入的 Agent。批量操作按每条连接注册时的凭证到期时间判断，轮换出的新凭证有自己的到期时间。命令返回逐目标结果，任一 Agent 未接受退出请求时返回非零退出码。
 
 ## 内置 MCP Tool 与权限矩阵
 
@@ -182,3 +191,24 @@ Hub 可从签发元数据和签名密钥重现原凭证。列表默认隐藏原�
 | `grep_file` | 流式正则检索文件（受匹配数与字节上限保护） | `read` | `readonly` |
 | `exec_command` | 无状态执行单条非交互命令（支持取消与进程组查杀） | `exec:restricted`（目标为 `full` 时需 `exec:full`） | `restricted` / `full` |
 | `shell_session` | 有状态持久化 Shell 会话（`open`/`run`/`close`） | `exec:session` | `full` |
+
+## 版本发布
+
+[Release 工作流](.github/workflows/release.yml)收到 `vMAJOR.MINOR.PATCH` 标签后，使用仓库固定的 mise 工具链运行测试、真实 Agent 端到端测试、静态检查及静态链接检查，通过后构建并发布 GitHub Release。手动运行工作流可预演同一套检查和打包流程，产物从该次 Actions 运行下载。
+
+每次正式发布提供三个 `.tar.gz` 归档和 `SHA256SUMS`。
+
+| 归档 | 平台 | 内容 |
+| --- | --- | --- |
+| `revmcp-hub-<版本>-linux-amd64.tar.gz` | Linux amd64 | Hub、渠道配置模板、Nginx 反代示例 |
+| `revmcp-agent-<版本>-linux-amd64.tar.gz` | Linux amd64 | 静态 Agent |
+| `revmcp-agent-<版本>-linux-arm64.tar.gz` | Linux arm64 | 静态 Agent |
+
+每个归档还包含 README、项目的 [MIT 许可证](LICENSE)和所用第三方依赖的许可文件。将三个归档和校验文件下载到同一目录后运行 `sha256sum -c SHA256SUMS`。
+
+本地预打包使用 `make release VERSION=v0.1.0`，文件生成在 `bin/release/v0.1.0/`。正式发布前，先把发布工作流和版本变更提交并推送到 `main`。在 GitHub Actions 手动运行 **Release**，检查通过后给已验证的提交打标签并推送：
+
+```bash
+git tag -a v0.1.0 -m "revmcp v0.1.0"
+git push origin refs/tags/v0.1.0
+```

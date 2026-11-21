@@ -1,4 +1,4 @@
-.PHONY: all build build-agent-linux-amd64 build-agent-linux-arm64 build-hub test test-e2e vet lint verify-static clean
+.PHONY: all build build-agent-linux-amd64 build-agent-linux-arm64 build-hub release test test-e2e vet lint verify-static clean
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS := -s -w -X main.version=$(VERSION)
@@ -7,6 +7,9 @@ BIN_DIR := bin
 all: build
 
 build: build-hub build-agent-linux-amd64 build-agent-linux-arm64
+
+release: build
+	bash scripts/package-release.sh "$(VERSION)"
 
 build-agent-linux-amd64:
 	@mkdir -p $(BIN_DIR)

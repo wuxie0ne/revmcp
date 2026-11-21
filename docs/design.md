@@ -87,7 +87,7 @@
 
 ### MCP 端点
 - 使用 `github.com/modelcontextprotocol/go-sdk` 的 `mcp.NewStreamableHTTPHandler(..., &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true})`（注：`Stateless: true` 下 `GET`/`DELETE` 返回 `405 Method Not Allowed`），并在单机隔离 Server 间复用 `mcp.NewSchemaCache()`。
-- MCP 路由通过 `auth.RequireBearerToken` 验证渠道 Bearer，处理器通过 `req.Extra.TokenInfo` 校验 scope 与目标规则。
+- MCP 路由通过 `auth.RequireBearerToken` 对每个 HTTP 请求验证渠道 Bearer，过期或失效凭证返回 `401`。已有 MCP 客户端会话发起的新请求也走相同的认证。工具处理器通过 `req.Extra.TokenInfo` 校验 scope 与目标规则。
 - 路由策略：
   - `/mcp`：聚合端点，所有远程工具均接收 `target_id`；
   - `/mcp/{target_id}`：单机隔离端点，工具 Schema 隐藏 `target_id`，在路由层绑定目标并校验权限，防止跨机误操作。
@@ -131,5 +131,6 @@
 - Hub 使用不可复用的渠道 ID。在线注册表按 `(channel_id, target_id)` 索引。
 - 新连接校验凭证和目标规则，预占名称后发送有超时的注册响应，成功后标记在线。同渠道的注册与删除、Agent 凭证变更串行协调。网络回包期间，其他渠道仍可管理。
 - 本地 JSON 状态文件保存签发元数据和吊销状态。Hub 对状态文件加进程锁，更新时同步并原子替换。管理员可重显仍有效的凭证，Hub 通过已保存的元数据和签名密钥重现原值。
-- MCP Bearer 被吊销后，后续请求被拒绝。Agent 注册 Token 被吊销后，后续注册被拒绝，已有连接继续在线。删除渠道会断开其在线连接。同名重建分配新 ID。
+- Agent 注册凭证到期、吊销或轮换后，使用原凭证的新连接被拒绝，已有连接继续在线。注册表保存每条连接通过注册时的凭证到期时间。批量下线向扫描时使用已过期凭证的在线连接发出关闭 RPC。换发凭证后，使用新凭证建立的连接会记录新的到期时间。
+- 删除渠道会断开其在线连接。同名重建分配新 ID。
 - Hub 拒绝意外的签名密钥变化。使用 `--accept-signing-key-change` 确认后，受影响的渠道凭证被持久化吊销，再由管理员轮换。
