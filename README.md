@@ -179,6 +179,27 @@ Hub 可从签发元数据和签名密钥重现原凭证。列表默认隐藏原�
 
 吊销 Agent 注册凭证也会阻止新连接和重连。管理员可用 `target kick` 下线单个在线目标，或用 `target kick --expired` 扫描所有渠道并下线使用已过期注册凭证接入的 Agent。批量操作按每条连接注册时的凭证到期时间判断，轮换出的新凭证有自己的到期时间。命令返回逐目标结果，任一 Agent 未接受退出请求时返回非零退出码。
 
+## MCP Scope 与 Agent Mode
+
+Scope 决定 MCP Bearer 可以调用的工具。签发渠道时可以重复传 `--scope`，也可以在渠道预设的 `mcp_scopes` 中配置。Hub 同时检查渠道和目标规则。
+
+| Scope | 权限 |
+| --- | --- |
+| `read` | 查看目标、系统信息、进程、监听端口，读取、搜索和下载文件。 |
+| `exec:restricted` | 在 `restricted` Agent 上执行通过 AST 白名单检查的单条命令。 |
+| `exec:full` | 在 `full` Agent 上执行单条命令和上传文件，同时包含 `exec:restricted`。 |
+| `exec:session` | 在 `full` Agent 上使用持久 Shell 会话和上传文件。 |
+
+`read` 独立授予。渠道签发、轮换和下线等管理操作使用独立的管理员 Bearer。
+
+Mode 决定 Agent 在目标机上允许执行的操作。`token issue --mode` 设置渠道允许的最高模式。`revmcp-agent --mode` 选择实际模式，默认 `readonly`，且不能超过渠道上限。
+
+| Agent Mode | Agent 允许的操作 |
+| --- | --- |
+| `readonly` | 只读诊断、文件读取、搜索和下载。 |
+| `restricted` | 只读操作及通过 AST 白名单的单条命令。 |
+| `full` | 只读操作、单条命令、持久 Shell 会话和文件上传。 |
+
 ## 内置 MCP Tool 与权限矩阵
 
 | Tool 名称 | 功能说明 | 所需北向 Scope | 目标机最低 `--mode` |
@@ -187,31 +208,31 @@ Hub 可从签发元数据和签名密钥重现原凭证。列表默认隐藏原�
 | `get_system_info` | 纯 Go 采集 CPU/内存/负载/内核/挂载点 | `read` | `readonly` |
 | `list_processes` | 纯 Go 采集 `/proc/[pid]` 进程列表（按 RSS 排序） | `read` | `readonly` |
 | `list_listening_ports` | 纯 Go 采集 `/proc/net` 监听端口与连接统计 | `read` | `readonly` |
-| `read_file` | 分块（`offset`）或尾部（`tail_lines`）受限读取文件 | `read` | `readonly` |
-| `download_file` | 下载一个常规文件，最多 10 MB，返回大小和 SHA-256 | `read` | `readonly` |
-| `upload_file` | 上传一个常规文件，最多 10 MB，校验后原子落盘 | `file:upload` | `full`，须设置 `--upload-dir` |
+| `read_file` | 分块（`offset`）或尾部（`tail_lines`）读取文件，每次最多 128 KiB，默认不压缩 | `read` | `readonly` |
+| `file`（`action=download`） | 下载完整文件，最多 10 MB | `read` | `readonly` |
+| `file`（`action=upload`） | 上传完整文件，最多 10 MB，校验后原子落盘 | `exec:full` 或 `exec:session` | `full` |
 | `grep_file` | 流式正则检索文件（受匹配数与字节上限保护） | `read` | `readonly` |
 | `exec_command` | 无状态执行单条非交互命令（支持取消与进程组查杀） | `exec:restricted`（目标为 `full` 时需 `exec:full`） | `restricted` / `full` |
 | `shell_session` | 有状态持久化 Shell 会话（`open`/`run`/`close`） | `exec:session` | `full` |
 
 ## 单文件传输
 
-每个文件最多 **10 MB（10,000,000 字节）**。升级 Hub 和需要传输文件的 Agent 至 v0.2.0。旧 Agent 可以继续使用原有工具。传输只处理文件字节，适合先上传配置再独立审查和部署。自定义反向代理需允许 MCP 请求体至少 14 MiB。
+每个文件最多 **10 MB（10,000,000 字节）**，按压缩前的大小计算。CLI 上传和 Agent 下载会在 gzip 能使文件更小时使用压缩。接收端限量解压并核对原始文件的 SHA-256，再将原始内容落盘。CLI 回执中的 `size` 是原始大小，`encoding` 和 `wire_size` 显示所用编码及编码后、Base64 前的字节数。
 
-上传需要渠道策略有 `file:upload`、Agent 以 `full` 运行，而且启动时指定 `--upload-dir`。已有渠道保留原 scope，可为需要上传的目标签发一个新渠道。Agent 侧提前创建由运维方控制的目标目录。目录参数可重复设置，也允许该目录下的子目录。
+下载需要 `read`。上传需要 `exec:full` 或 `exec:session`，目标 Agent 须以 `full` 运行。上传路径受 Agent 进程的文件系统权限、`--deny-path` 和默认敏感路径保护约束。下载同时遵循 `--allow-path`。
 
 ```bash
 # Hub 管理终端签发一次
 ./bin/revmcp-hub token issue --config hub.channels.local.yaml \
   --name deploy-app01 --allowed-target app01 --mode full \
-  --scope read --scope file:upload
+  --scope read --scope exec:full
 
 # 在 APP01 启动 Agent，加载上一步的 enrollment_token
 ./revmcp-agent-linux-amd64 --hub wss://mcp.example.com/agent/ws \
-  --target-id app01 --mode full --upload-dir /data/deploy
+  --target-id app01 --mode full
 ```
 
-在文件所在机器使用发行包里的 `revmcp-hub file`。环境变量 `REVMCP_BEARER_TOKEN` 使用该渠道的 `mcp_bearer`。CLI 从磁盘读取或写入文件，只输出大小和 SHA-256。
+在文件所在机器使用发行包里的 `revmcp-hub file`。环境变量 `REVMCP_BEARER_TOKEN` 使用该渠道的 `mcp_bearer`。CLI 从磁盘读取或写入文件，输出传输元数据。自定义反向代理需允许 MCP 请求体至少 14 MiB，以支持无法压缩的 10 MB 文件。
 
 ```bash
 ./bin/revmcp-hub file upload --endpoint https://mcp.example.com/mcp \
@@ -221,15 +242,21 @@ Hub 可从签发元数据和签名密钥重现原凭证。列表默认隐藏原�
   --remote /data/deploy/infrastructure.yaml --local ./infrastructure.received.yaml
 ```
 
-省略 `--overwrite` 时，目标已存在会拒绝。显式覆盖会以权限 `0600` 的新文件替换旧文件。路径须为绝对远端路径，父目录必须存在，上传和下载均拒绝远端符号链接及特殊文件。下载沿用 `--allow-path`、`--deny-path` 及默认敏感路径保护。上传使用独立的 `--upload-dir`，同时执行 `--deny-path` 和默认敏感路径保护。
+省略 `--overwrite` 时，目标已存在会拒绝。显式覆盖会以权限 `0600` 的新文件替换旧文件。远端路径须为绝对路径，父目录必须存在，上传和下载均拒绝远端符号链接及特殊文件。
 
-直接调用 MCP 时，`upload_file` 接收 `path`、原始字节数 `size`、小写十六进制 `sha256`、`content_base64` 和可选的 `overwrite`。`download_file` 接收 `path`，返回 `remote_output` 内的 Base64 和结构化的 `size`、`sha256`。聚合端点还需要 `target_id`。较大文件推荐用 CLI，以免把文件内容带入 AI 上下文。
+直接调用 MCP 时，工具名为 `file`，参数为 `action`（`download` 或 `upload`）和 `path`。聚合端点还需要 `target_id`。上传另须提供 `upload` 对象，包含原始大小 `size`、原始内容摘要 `sha256`、`encoding`（`identity` 或 `gzip`）、`wire_size`、`content_base64` 和可选的 `overwrite`。下载返回 `remote_output` 内的 Base64 和结构化元数据。几 MB 的文件优先用 CLI，避免把负载带入 AI 上下文。由于 `file` 支持上传，客户端可能对下载也显示写入审批，请核对 `action`。
+
+### 从 v0.2.0 升级
+
+- 使用新版 `file` 时，升级 Hub、目标 Agent 和文件传输 CLI 至 v0.2.1。直调 MCP 的客户端将 `download_file`、`upload_file` 改为 `file` 并指定动作。旧 Agent 可继续使用原有诊断和命令工具。
+- 重启 Agent 前，从启动命令或服务单元移除 `--upload-dir`。如果 Hub 配置的 `mcp_scopes` 使用了 `file:upload`，启动前将它移除或按需替换为执行 Scope。
+- 已签发渠道的记录可继续加载。旧 `file:upload` 本身不再授权上传。需要上传且没有合适执行 Scope 的渠道，按上述命令签发并切换到带有效执行 Scope 的渠道。
 
 ## 版本发布
 
 [Release 工作流](.github/workflows/release.yml)收到 `vMAJOR.MINOR.PATCH` 标签后，使用仓库固定的 mise 工具链运行测试、真实 Agent 端到端测试、静态检查及静态链接检查，通过后构建并发布 GitHub Release。手动运行时留空 `release_tag` 即可预演同一套检查和打包流程，产物从该次 Actions 运行下载。
 
-每次正式发布提供三个 `.tar.gz` 归档和 `SHA256SUMS`。
+每次正式发布提供三个 `.tar.gz` 归档和 `SHA256SUMS`。版本在 `docs/releases/<版本>.md` 提供正文时，工作流会用它发布变动说明和升级步骤。
 
 | 归档 | 平台 | 内容 |
 | --- | --- | --- |

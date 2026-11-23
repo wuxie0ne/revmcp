@@ -63,7 +63,6 @@ func main() {
 		noDefaultDeny bool
 		showVersion   bool
 		allowPaths    listFlags
-		uploadDirs    listFlags
 		denyPaths     listFlags
 		tags          = make(tagFlags)
 	)
@@ -79,7 +78,6 @@ func main() {
 	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
 	flag.Var(&allowPaths, "allow-path", "Optional allowed file path glob/prefix for read tools (repeatable)")
 	flag.Var(&denyPaths, "deny-path", "Optional denied file path glob/prefix for file tools (repeatable)")
-	flag.Var(&uploadDirs, "upload-dir", "Enable file uploads under this absolute directory in full mode (repeatable)")
 	flag.Var(tags, "tag", "Optional target metadata tag in key=value format (repeatable)")
 	flag.Parse()
 
@@ -89,13 +87,6 @@ func main() {
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-
-	for _, dir := range uploadDirs {
-		if err := fsread.ValidateUploadDir(dir); err != nil {
-			logger.Error("invalid --upload-dir", "dir", dir, "err", err)
-			os.Exit(2)
-		}
-	}
 
 	if token == "" {
 		token = os.Getenv("REVMCP_ENROLL_TOKEN")
@@ -244,7 +235,7 @@ func main() {
 			if err := json.Unmarshal(req.Params, &p); err != nil {
 				return nil, &proto.RPCError{Code: proto.ErrCodeInvalidArgument, Message: err.Error()}
 			}
-			res, err := fileReader.Upload(rpcCtx, uploadDirs, p, req.Data)
+			res, err := fileReader.Upload(rpcCtx, p, req.Data)
 			return res, transferRPCError(err)
 
 		case proto.MethodCmdExec:
@@ -337,17 +328,17 @@ func main() {
 		Token:      token,
 		CACertPath: caCertPath,
 		AgentInfo: proto.AgentInfo{
-			TargetID:     targetID,
-			Hostname:     hostname,
-			OS:           runtime.GOOS,
-			Kernel:       kernel,
-			Arch:         runtime.GOARCH,
-			InContainer:  inContainer,
-			Mode:         mode,
-			Version:      version,
-			Tags:         tags,
-			StartedAt:    startedAt,
-			FileTransfer: true,
+			TargetID:            targetID,
+			Hostname:            hostname,
+			OS:                  runtime.GOOS,
+			Kernel:              kernel,
+			Arch:                runtime.GOARCH,
+			InContainer:         inContainer,
+			Mode:                mode,
+			Version:             version,
+			Tags:                tags,
+			StartedAt:           startedAt,
+			FileTransferVersion: proto.FileTransferVersion,
 		},
 		Handler: handler,
 		Logger:  logger,

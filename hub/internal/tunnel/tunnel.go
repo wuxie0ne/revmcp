@@ -338,11 +338,14 @@ func (c *sessionCaller) Call(ctx context.Context, method string, params any, res
 		}
 	}
 	if download, ok := resultDst.(*proto.FileDownload); ok {
-		data, err := proto.ReadFilePayload(stream, download.Size)
+		if err := download.Validate(); err != nil {
+			return err
+		}
+		data, err := proto.ReadFilePayload(stream, download.WireSize)
 		if err != nil {
 			return err
 		}
-		if err := proto.ValidateFilePayload(download.Size, download.SHA256, data); err != nil {
+		if _, err := proto.DecodeFilePayload(download.FileTransferResult, data); err != nil {
 			return err
 		}
 		download.Data = data

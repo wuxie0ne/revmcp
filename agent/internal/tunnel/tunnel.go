@@ -272,8 +272,11 @@ func (c *Client) handleStream(parentCtx context.Context, stream *yamux.Stream) {
 		var upload proto.FSUploadRequest
 		err := json.Unmarshal(req.Params, &upload)
 		if err == nil {
+			err = upload.Validate()
+		}
+		if err == nil {
 			_ = stream.SetReadDeadline(time.Now().Add(60 * time.Second))
-			req.Data, err = proto.ReadFilePayload(stream, upload.Size)
+			req.Data, err = proto.ReadFilePayload(stream, upload.WireSize)
 			_ = stream.SetReadDeadline(time.Time{})
 		}
 		if err != nil {

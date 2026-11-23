@@ -58,25 +58,24 @@ func (r *Reader) Download(ctx context.Context, path string) (*proto.FileDownload
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return &proto.FileDownload{
-		FileTransferResult: proto.FileTransferResult{Size: len(data), SHA256: proto.FileSHA256(data)},
-		Data:               data,
-	}, nil
+	meta, payload, err := proto.EncodeFilePayload(data)
+	if err != nil {
+		return nil, err
+	}
+	return &proto.FileDownload{FileTransferResult: meta, Data: payload}, nil
 }
 
-// Upload writes a verified file into an explicitly enabled directory without following symlinks.
-func (r *Reader) Upload(ctx context.Context, uploadDirs []string, req proto.FSUploadRequest, data []byte) (*proto.FileTransferResult, error) {
+// Upload writes a verified file into the destination without following symlinks.
+func (r *Reader) Upload(ctx context.Context, req proto.FSUploadRequest, payload []byte) (*proto.FileTransferResult, error) {
 	path, err := transferPath(req.Path)
 	if err != nil {
 		return nil, err
 	}
-	if !withinUploadDirs(uploadDirs, path) {
-		return nil, fmt.Errorf("%w: destination is outside configured --upload-dir directories", ErrPathDenied)
-	}
 	if err := r.checkDeniedPaths(path, path); err != nil {
 		return nil, err
 	}
-	if err := proto.ValidateFilePayload(req.Size, req.SHA256, data); err != nil {
+	data, err := proto.DecodeFilePayload(req.FileTransferResult, payload)
+	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidPath, err)
 	}
 	parent, err := openTransferParent(path)
@@ -115,23 +114,7 @@ func (r *Reader) Upload(ctx context.Context, uploadDirs []string, req proto.FSUp
 	if err != nil {
 		return nil, err
 	}
-	return &proto.FileTransferResult{Size: req.Size, SHA256: req.SHA256}, nil
-}
-
-func ValidateUploadDir(path string) error {
-	if !filepath.IsAbs(path) || filepath.Clean(path) != path || path == "/" {
-		return fmt.Errorf("upload directory must be a clean absolute path other than /")
-	}
-	return nil
-}
-
-func withinUploadDirs(dirs []string, path string) bool {
-	for _, dir := range dirs {
-		if ValidateUploadDir(dir) == nil && strings.HasPrefix(path, dir+"/") {
-			return true
-		}
-	}
-	return false
+	return &req.FileTransferResult, nil
 }
 
 func transferPath(path string) (string, error) {

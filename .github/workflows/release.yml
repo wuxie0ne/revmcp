@@ -89,6 +89,9 @@ jobs:
         run: |
           make release VERSION="$VERSION"
           (cd "bin/release/$VERSION" && sha256sum -c SHA256SUMS)
+          if [[ -f "docs/releases/$VERSION.md" ]]; then
+            cp "docs/releases/$VERSION.md" "bin/release/$VERSION/release-notes.md"
+          fi
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -131,5 +134,9 @@ jobs:
             echo "The remote tag no longer points at the build commit." >&2
             exit 1
           fi
-          gh release create "$VERSION" --verify-tag --generate-notes --title "$VERSION" \
+          notes=(--generate-notes)
+          if [[ -f release-notes.md ]]; then
+            notes=(--notes-file release-notes.md)
+          fi
+          gh release create "$VERSION" --verify-tag "${notes[@]}" --title "$VERSION" \
             ./*.tar.gz SHA256SUMS

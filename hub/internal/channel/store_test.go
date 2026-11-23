@@ -254,3 +254,44 @@ func TestSigningKeyChangeCannotReviveCredential(t *testing.T) {
 		t.Fatal("new credential was not generated after an approved key change")
 	}
 }
+
+func TestRetiredUploadScopeInStoredChannels(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "channel-state.json")
+	store, err := Open(statePath, testAgentKey, testMCPKey, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := Policy{
+		Target: "node", Mode: proto.ModeFull, AgentTTL: time.Hour, MCPTTL: time.Hour,
+		MCPScopes: []string{"read"},
+	}
+	if _, err := store.Issue("work", original); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write the policy in the shape persisted by v0.2.0.
+	records := store.recordsCopy()
+	old := records["work"]
+	old.Policy.MCPScopes = []string{"read", "file:upload"}
+	records["work"] = old
+	if err := store.commit(records); err != nil {
+		t.Fatal(err)
+	}
+	oldBearer := store.detail(old, true, "").Bearer
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(statePath, testAgentKey, testMCPKey, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	record, _, err := store.Verify(oldBearer, MCP)
+	if err != nil || strings.Join(record.Policy.MCPScopes, ",") != "read,file:upload" {
+		t.Fatalf("existing credential changed during upgrade: %v", err)
+	}
+	if _, err := store.Issue("new", old.Policy); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("new channel accepted retired scope: %v", err)
+	}
+}

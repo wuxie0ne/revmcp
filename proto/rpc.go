@@ -108,17 +108,17 @@ func (e *RPCError) Error() string {
 
 // AgentInfo describes a connected target host or container.
 type AgentInfo struct {
-	TargetID     string            `json:"target_id"`
-	Hostname     string            `json:"hostname"`
-	OS           string            `json:"os"`
-	Kernel       string            `json:"kernel"`
-	Arch         string            `json:"arch"`
-	InContainer  bool              `json:"in_container"`
-	Mode         Mode              `json:"mode"`
-	Version      string            `json:"version"`
-	Tags         map[string]string `json:"tags,omitempty"`
-	StartedAt    time.Time         `json:"started_at"`
-	FileTransfer bool              `json:"file_transfer,omitempty"`
+	TargetID            string            `json:"target_id"`
+	Hostname            string            `json:"hostname"`
+	OS                  string            `json:"os"`
+	Kernel              string            `json:"kernel"`
+	Arch                string            `json:"arch"`
+	InContainer         bool              `json:"in_container"`
+	Mode                Mode              `json:"mode"`
+	Version             string            `json:"version"`
+	Tags                map[string]string `json:"tags,omitempty"`
+	StartedAt           time.Time         `json:"started_at"`
+	FileTransferVersion int               `json:"file_transfer_version,omitempty"`
 }
 
 // RegisterRequest is sent on the initial agent->hub stream after WebSocket upgrade.

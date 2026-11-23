@@ -263,3 +263,42 @@ func addTestTarget(t *testing.T, reg *registry.Registry, channelID string, info 
 	}
 	reg.Activate(channelID, info.TargetID, entry.Generation)
 }
+
+func TestFileUploadRequiresFullAgentAndExecutionScope(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		scope    string
+		mode     proto.Mode
+		rejected string
+	}{
+		{"full scope", policy.ScopeExecFull, proto.ModeFull, ""},
+		{"session scope", policy.ScopeExecSession, proto.ModeFull, ""},
+		{"restricted scope", policy.ScopeExecRestricted, proto.ModeFull, "requires exec:full or exec:session"},
+		{"readonly scope", policy.ScopeRead, proto.ModeFull, "requires exec:full or exec:session"},
+		{"restricted mode", policy.ScopeExecFull, proto.ModeRestricted, "requires full Agent mode"},
+		{"readonly mode", policy.ScopeExecSession, proto.ModeReadOnly, "requires full Agent mode"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, credentials := issueMCPTestChannel(t, []string{tc.scope})
+			reg := registry.New()
+			addTestTarget(t, reg, credentials.ChannelID, proto.AgentInfo{
+				TargetID: "prod-node", Mode: tc.mode, FileTransferVersion: proto.FileTransferVersion,
+			})
+			mux := http.NewServeMux()
+			NewGateway("test", reg, nil).RegisterRoutes(mux, hubauth.NewChannelBearerVerifier(store))
+			server := httptest.NewServer(mux)
+			defer server.Close()
+
+			request := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"file","arguments":{"action":"upload","path":"/tmp/demo","upload":{"size":0,"wire_size":0,"encoding":"identity","sha256":"` +
+				proto.FileSHA256(nil) + `","content_base64":""}}}}`
+			status, body := postMCP(t, server.URL+"/mcp/prod-node", credentials.Bearer, request)
+			if status != http.StatusOK {
+				t.Fatalf("unexpected HTTP status %d: %s", status, body)
+			}
+			failed := strings.Contains(body, `"isError":true`)
+			if failed != (tc.rejected != "") || !strings.Contains(body, tc.rejected) {
+				t.Fatalf("expected rejection %q, got %s", tc.rejected, body)
+			}
+		})
+	}
+}

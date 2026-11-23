@@ -157,7 +157,7 @@ func (s *Store) load(acceptKeyChange bool) error {
 		if name != record.Name || !ValidName(name) || !validID(record.ID) ||
 			!validID(record.Agent.Version) || !validID(record.MCP.Version) ||
 			!validID(record.Agent.KeyID) || !validID(record.MCP.KeyID) ||
-			record.Agent.Expires <= 0 || record.MCP.Expires <= 0 || record.Policy.Validate() != nil ||
+			record.Agent.Expires <= 0 || record.MCP.Expires <= 0 || record.Policy.validate(true) != nil ||
 			s.byID[record.ID] != "" {
 			return errors.New("invalid record in channel state")
 		}
@@ -262,6 +262,11 @@ func ValidName(name string) bool {
 }
 
 func (p Policy) Validate() error {
+	return p.validate(false)
+}
+
+// Existing v0.2.0 records may contain the retired scope. It grants no tool access.
+func (p Policy) validate(allowRetiredScope bool) error {
 	if p.Target == "" || p.Target == "." || p.Target == ".." || len(p.Target) > 128 || strings.ContainsAny(p.Target, "/\\ \t\r\n") {
 		return fmt.Errorf("%w: invalid target rule", ErrInvalid)
 	}
@@ -281,10 +286,14 @@ func (p Policy) Validate() error {
 	}
 	for _, scope := range p.MCPScopes {
 		switch scope {
-		case "read", "exec:restricted", "exec:full", "exec:session", "file:upload":
-		default:
-			return fmt.Errorf("%w: unsupported MCP scope", ErrInvalid)
+		case "read", "exec:restricted", "exec:full", "exec:session":
+			continue
+		case "file:upload":
+			if allowRetiredScope {
+				continue
+			}
 		}
+		return fmt.Errorf("%w: unsupported MCP scope %q", ErrInvalid, scope)
 	}
 	return nil
 }

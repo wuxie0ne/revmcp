@@ -368,7 +368,7 @@ func (g *Gateway) handleListTargets(_ context.Context, req *mcp.CallToolRequest,
 			Mode:         e.Info.Mode,
 			Tags:         e.Info.Tags,
 			UptimeSec:    int64(time.Since(e.ConnectedAt).Seconds()),
-			FileTransfer: e.Info.FileTransfer,
+			FileTransfer: e.Info.FileTransferVersion == proto.FileTransferVersion,
 		})
 	}
 

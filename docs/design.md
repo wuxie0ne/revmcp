@@ -67,9 +67,9 @@
 
 - 单帧最大上限：`2 MiB`（`proto.MaxFrameSize`），超限立即拒绝以防 OOM。
 - `Response` 使用结构化 `RPCError{Code, Message, Retryable}`，便于 Hub 准确映射为 MCP Tool 错误与审计决策。
-- 注册元数据 `file_transfer` 表示 Agent 支持新文件 RPC。旧 Agent 的其他 RPC 无需更新。
-- `fs.upload` 的请求 JSON 帧声明路径、原始大小、SHA-256 和覆盖策略。紧接着传声明数量的原始文件字节，响应仍为 JSON 帧。
-- `fs.download` 的成功响应 JSON 帧声明原始大小和 SHA-256，紧接着传原始字节。双方限长 10,000,000 字节，保留 2 MiB JSON 单帧上限。Hub 在回传下载前重新校验长度及摘要。
+- 注册元数据 `file_transfer_version` 表示 Agent 支持的文件协议版本。Hub 在发起文件 RPC 前检查版本，既有诊断和命令 RPC 独立可用。
+- `fs.upload` 请求帧包含路径、覆盖策略、原始大小 `size`、摘要 `sha256`、编码 `encoding` 和编码后大小 `wire_size`。请求帧之后传 `wire_size` 字节，响应为 JSON 帧。`fs.download` 在成功响应帧中声明同样的文件元数据，之后传编码后的字节。
+- 文件编码为 `identity` 或 `gzip`，发送方仅在 gzip 更小时使用它。声明的原始大小与编码后大小均不得超过 10,000,000 字节，解压输出限制在声明大小加一个探测字节，确认原始长度和 SHA-256 后方可落盘。JSON 帧继续使用 2 MiB 上限。
 
 ### RPC 方法表
 
@@ -81,7 +81,7 @@
 | `proc.list` | Hub -> Agent | 纯 Go 读 `/proc/[pid]` 返回进程列表 | `readonly` |
 | `net.sockets` | Hub -> Agent | 纯 Go 读 `/proc/net/tcp{,6},udp{,6}` 返回监听端口与连接统计 | `readonly` |
 | `fs.read` | Hub -> Agent | 分块或尾部读取常规/伪文件（拒绝阻塞设备与 FIFO） | `readonly` |
-| `fs.upload` | Hub -> Agent | 校验后将单文件原子落盘 | `full` 与显式上传目录 |
+| `fs.upload` | Hub -> Agent | 校验后将单文件原子落盘 | `full` |
 | `fs.download` | Hub -> Agent | 在只读路径策略内读取单个常规文件 | `readonly` |
 | `fs.grep` | Hub -> Agent | 流式正则检索文件（限制单行扫描与最大匹配数） | `readonly` |
 | `cmd.exec` | Hub -> Agent | 无状态执行单条命令（`restricted` 下走 AST 白名单校验） | `restricted` / `full` |
@@ -100,9 +100,10 @@
 
 ### 单文件传输
 
-- `upload_file` 与 `download_file` 共用原有 MCP 通道和认证。MCP JSON 使用 Base64，HTTP 请求体上限为 14 MiB。下载元数据以结构化方式返回，文件字节的 Base64 表示包裹在 `remote_output` 内。
-- 上传仅授予具有 `file:upload` 的 Bearer，且 Hub 和 Agent 均检查 `full` 模式。Agent 仅在现有 `--upload-dir` 子路径下落盘，执行敏感及自定义禁止路径规则，通过目录描述符逐级打开路径并拒绝符号链接。
-- 上传在同一目录暂存并同步文件，在最终路径原子发布。默认使用链接确保目标已存在时失败。显式覆盖使用原子重命名。内容和凭证原值不进入审计。
+- MCP 工具 `file` 以 `action=download|upload` 区分操作，JSON 用 Base64 表示编码后的文件字节。Hub 校验文件元数据与内容，保留 `remote_output` 边界，HTTP 请求体上限 14 MiB。`read_file` 保持原有有限文本读取路径。
+- 下载需要 `read`。上传需要 `exec:full` 或 `exec:session`，Hub 与 Agent 都校验 `full` 模式。上传执行敏感路径和自定义拒绝规则，并通过目录描述符逐级打开路径，拒绝符号链接。
+- 上传在同一目录暂存并同步原始内容，在目标路径原子发布。默认使用链接确保目标已存在时失败。显式覆盖使用原子重命名。内容和凭证原值不进入审计。
+- 已保存的 v0.2.0 渠道允许载入已退役的 `file:upload` Scope，以保留凭证和其他现有权限。此 Scope 无工具授权，新签发及配置预设拒绝该值。使用新 Scope 的渠道完成切换后，可删除旧渠道和对应记录。
 
 ### Admin HTTP API
 

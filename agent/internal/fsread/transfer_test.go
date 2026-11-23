@@ -36,17 +36,25 @@ func TestTransferPathBoundaries(t *testing.T) {
 			t.Errorf("download unexpectedly permitted: %s", path)
 		}
 	}
-	for _, path := range []string{existing, fifo, link, filepath.Join(link, "existing"), filepath.Join(dir, "denied")} {
-		req := proto.FSUploadRequest{Path: path, Size: len(data), SHA256: proto.FileSHA256(data), Overwrite: true}
-		if _, err := reader.Upload(ctx, []string{dir}, req, data); err == nil {
+	meta, payload, err := proto.EncodeFilePayload(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{fifo, link, filepath.Join(link, "existing"), filepath.Join(dir, "denied")} {
+		req := proto.FSUploadRequest{Path: path, FileTransferResult: meta, Overwrite: true}
+		if _, err := reader.Upload(ctx, req, payload); err == nil {
 			t.Errorf("upload unexpectedly permitted: %s", path)
 		}
 	}
+	if _, err := reader.Upload(ctx, proto.FSUploadRequest{Path: existing, FileTransferResult: meta, Overwrite: true}, payload); err != nil {
+		t.Fatalf("upload should use filesystem permissions independently of the read allowlist: %v", err)
+	}
+
 	dest := filepath.Join(dir, "new-file")
-	req := proto.FSUploadRequest{Path: dest, Size: len(data), SHA256: proto.FileSHA256(data)}
+	req := proto.FSUploadRequest{Path: dest, FileTransferResult: meta}
 	cancelled, cancel := context.WithCancel(ctx)
 	cancel()
-	if _, err := reader.Upload(cancelled, []string{dir}, req, data); !errors.Is(err, context.Canceled) {
+	if _, err := reader.Upload(cancelled, req, payload); !errors.Is(err, context.Canceled) {
 		t.Fatalf("unexpected cancelled upload result: %v", err)
 	}
 	if _, err := os.Stat(dest); !errors.Is(err, os.ErrNotExist) {

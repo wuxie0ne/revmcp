@@ -63,7 +63,7 @@ func runFile(args []string) error {
 		return errors.New("REVMCP_BEARER_TOKEN is required")
 	}
 
-	params := map[string]any{"path": *remote}
+	params := map[string]any{"action": action, "path": *remote}
 	if *target != "" {
 		params["target_id"] = *target
 	}
@@ -73,11 +73,15 @@ func runFile(args []string) error {
 		if err != nil {
 			return err
 		}
-		expected = proto.FileTransferResult{Size: len(data), SHA256: proto.FileSHA256(data)}
-		params["size"] = expected.Size
-		params["sha256"] = expected.SHA256
-		params["overwrite"] = *overwrite
-		params["content_base64"] = base64.StdEncoding.EncodeToString(data)
+		meta, payload, err := proto.EncodeFilePayload(data)
+		if err != nil {
+			return err
+		}
+		expected = meta
+		params["upload"] = map[string]any{
+			"size": meta.Size, "sha256": meta.SHA256, "encoding": meta.Encoding, "wire_size": meta.WireSize,
+			"overwrite": *overwrite, "content_base64": base64.StdEncoding.EncodeToString(payload),
+		}
 	}
 
 	parent, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -100,7 +104,7 @@ func runFile(args []string) error {
 		return err
 	}
 	defer func() { _ = session.Close() }()
-	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: action + "_file", Arguments: params})
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "file", Arguments: params})
 	if err != nil {
 		return err
 	}
@@ -182,8 +186,8 @@ func fileTransferMetadata(result *mcp.CallToolResult) (proto.FileTransferResult,
 	if err := json.Unmarshal(raw, &meta); err != nil {
 		return meta, err
 	}
-	if meta.Size < 0 || meta.Size > proto.MaxFileTransferBytes || len(meta.SHA256) != 64 {
-		return meta, errors.New("server returned invalid file transfer metadata")
+	if err := meta.Validate(); err != nil {
+		return meta, fmt.Errorf("server returned invalid file transfer metadata: %w", err)
 	}
 	return meta, nil
 }
@@ -198,14 +202,15 @@ func saveDownload(result *mcp.CallToolResult, meta proto.FileTransferResult, pat
 	}
 	_, body, opened := strings.Cut(content.Text, ">\n")
 	encoded, closed := strings.CutSuffix(body, "\n</remote_output>")
-	if !opened || !closed || len(encoded) != base64.StdEncoding.EncodedLen(meta.Size) {
+	if !opened || !closed {
 		return errors.New("server returned invalid file content")
 	}
-	data, err := base64.StdEncoding.Strict().DecodeString(encoded)
+	payload, err := proto.DecodeFileBase64(meta, encoded)
 	if err != nil {
 		return err
 	}
-	if err := proto.ValidateFilePayload(meta.Size, meta.SHA256, data); err != nil {
+	data, err := proto.DecodeFilePayload(meta, payload)
+	if err != nil {
 		return err
 	}
 	return writeLocalDownload(path, data, overwrite)

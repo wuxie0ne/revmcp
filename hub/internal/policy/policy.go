@@ -29,7 +29,6 @@ func TraceIDFromContext(ctx context.Context) string {
 
 const (
 	ScopeRead           = "read"
-	ScopeFileUpload     = "file:upload"
 	ScopeExecRestricted = "exec:restricted"
 	ScopeExecFull       = "exec:full"
 	ScopeExecSession    = "exec:session"

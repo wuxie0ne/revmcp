@@ -129,7 +129,7 @@ func TestRealAgentBinaryFullLifecycleAndSelfDestruct(t *testing.T) {
 		return detail
 	}
 	credentials := issue("e2e", "e2e-node-01", proto.ModeFull,
-		policy.ScopeRead, policy.ScopeExecRestricted, policy.ScopeExecFull, policy.ScopeExecSession, policy.ScopeFileUpload)
+		policy.ScopeRead, policy.ScopeExecRestricted, policy.ScopeExecFull, policy.ScopeExecSession)
 
 	reg := registry.New()
 	var auditBuf syncBuffer
@@ -159,7 +159,6 @@ func TestRealAgentBinaryFullLifecycleAndSelfDestruct(t *testing.T) {
 		"--target-id", "e2e-node-01",
 		"--mode", "full",
 		"--tag", "env=e2e",
-		"--upload-dir", tmpDir,
 	)
 	if err := agentCmd.Start(); err != nil {
 		t.Fatalf("start agent binary: %v", err)
