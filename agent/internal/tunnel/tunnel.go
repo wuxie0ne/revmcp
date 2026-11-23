@@ -268,6 +268,22 @@ func (c *Client) handleStream(parentCtx context.Context, stream *yamux.Stream) {
 		return
 	}
 
+	if req.Method == proto.MethodFSUpload {
+		var upload proto.FSUploadRequest
+		err := json.Unmarshal(req.Params, &upload)
+		if err == nil {
+			_ = stream.SetReadDeadline(time.Now().Add(60 * time.Second))
+			req.Data, err = proto.ReadFilePayload(stream, upload.Size)
+			_ = stream.SetReadDeadline(time.Time{})
+		}
+		if err != nil {
+			_ = proto.WriteFrame(stream, proto.Response{ID: req.ID, Error: &proto.RPCError{
+				Code: proto.ErrCodeInvalidArgument, Message: err.Error(),
+			}})
+			return
+		}
+	}
+
 	rpcCtx, cancel := context.WithCancel(parentCtx)
 	defer cancel()
 
@@ -298,5 +314,10 @@ func (c *Client) handleStream(parentCtx context.Context, stream *yamux.Stream) {
 		}
 	}
 
-	_ = proto.WriteFrame(stream, resp)
+	if err := proto.WriteFrame(stream, resp); err != nil || resp.Error != nil {
+		return
+	}
+	if download, ok := result.(*proto.FileDownload); ok {
+		_ = proto.WriteFilePayload(stream, download.Data)
+	}
 }

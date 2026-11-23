@@ -71,6 +71,8 @@ func (g *Gateway) RegisterRoutes(mux *http.ServeMux, verifier sdkauth.TokenVerif
 	opts := &mcp.StreamableHTTPOptions{
 		Stateless:    true,
 		JSONResponse: true,
+		// A 10 MB upload expands to about 13.4 MB in Base64.
+		MaxRequestBodyBytes: 14 * 1024 * 1024,
 	}
 
 	aggHandler := mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
@@ -115,13 +117,14 @@ type ListTargetsInput struct {
 }
 
 type TargetSummary struct {
-	TargetID    string            `json:"target_id"`
-	Hostname    string            `json:"hostname"`
-	Arch        string            `json:"arch"`
-	InContainer bool              `json:"in_container"`
-	Mode        proto.Mode        `json:"mode"`
-	Tags        map[string]string `json:"tags,omitempty"`
-	UptimeSec   int64             `json:"online_seconds"`
+	TargetID     string            `json:"target_id"`
+	Hostname     string            `json:"hostname"`
+	Arch         string            `json:"arch"`
+	InContainer  bool              `json:"in_container"`
+	Mode         proto.Mode        `json:"mode"`
+	Tags         map[string]string `json:"tags,omitempty"`
+	UptimeSec    int64             `json:"online_seconds"`
+	FileTransfer bool              `json:"file_transfer"`
 }
 
 type ListTargetsOutput struct {
@@ -202,6 +205,7 @@ type IsolatedShellSessionInput struct {
 }
 
 func (g *Gateway) registerAggregatedTools(srv *mcp.Server) {
+	g.registerTransferTools(srv, "")
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "list_targets",
 		Description: "List currently online remote targets permitted for the caller.",
@@ -272,6 +276,7 @@ func (g *Gateway) registerAggregatedTools(srv *mcp.Server) {
 }
 
 func (g *Gateway) registerIsolatedTools(srv *mcp.Server, targetID string) {
+	g.registerTransferTools(srv, targetID)
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "get_system_info",
 		Description: fmt.Sprintf("Collect CPU, memory, load average, kernel, and uptime on target %q.", targetID),
@@ -356,13 +361,14 @@ func (g *Gateway) handleListTargets(_ context.Context, req *mcp.CallToolRequest,
 			continue
 		}
 		out.Targets = append(out.Targets, TargetSummary{
-			TargetID:    e.Info.TargetID,
-			Hostname:    e.Info.Hostname,
-			Arch:        e.Info.Arch,
-			InContainer: e.Info.InContainer,
-			Mode:        e.Info.Mode,
-			Tags:        e.Info.Tags,
-			UptimeSec:   int64(time.Since(e.ConnectedAt).Seconds()),
+			TargetID:     e.Info.TargetID,
+			Hostname:     e.Info.Hostname,
+			Arch:         e.Info.Arch,
+			InContainer:  e.Info.InContainer,
+			Mode:         e.Info.Mode,
+			Tags:         e.Info.Tags,
+			UptimeSec:    int64(time.Since(e.ConnectedAt).Seconds()),
+			FileTransfer: e.Info.FileTransfer,
 		})
 	}
 
@@ -519,6 +525,11 @@ func (g *Gateway) callAgent(
 	entry, ok := g.registry.GetIn(hubauth.ChannelID(info), targetID)
 	if !ok {
 		err := fmt.Errorf("target %q is offline", targetID)
+		g.auditCall(traceID, info, targetID, toolName, auditArgs, "deny", err.Error(), nil, time.Since(start), false)
+		return err
+	}
+
+	if err := checkTransferAgent(rpcMethod, entry.Info); err != nil {
 		g.auditCall(traceID, info, targetID, toolName, auditArgs, "deny", err.Error(), nil, time.Since(start), false)
 		return err
 	}

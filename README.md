@@ -188,9 +188,42 @@ Hub 可从签发元数据和签名密钥重现原凭证。列表默认隐藏原�
 | `list_processes` | 纯 Go 采集 `/proc/[pid]` 进程列表（按 RSS 排序） | `read` | `readonly` |
 | `list_listening_ports` | 纯 Go 采集 `/proc/net` 监听端口与连接统计 | `read` | `readonly` |
 | `read_file` | 分块（`offset`）或尾部（`tail_lines`）受限读取文件 | `read` | `readonly` |
+| `download_file` | 下载一个常规文件，最多 10 MB，返回大小和 SHA-256 | `read` | `readonly` |
+| `upload_file` | 上传一个常规文件，最多 10 MB，校验后原子落盘 | `file:upload` | `full`，须设置 `--upload-dir` |
 | `grep_file` | 流式正则检索文件（受匹配数与字节上限保护） | `read` | `readonly` |
 | `exec_command` | 无状态执行单条非交互命令（支持取消与进程组查杀） | `exec:restricted`（目标为 `full` 时需 `exec:full`） | `restricted` / `full` |
 | `shell_session` | 有状态持久化 Shell 会话（`open`/`run`/`close`） | `exec:session` | `full` |
+
+## 单文件传输
+
+每个文件最多 **10 MB（10,000,000 字节）**。升级 Hub 和需要传输文件的 Agent 至 v0.2.0。旧 Agent 可以继续使用原有工具。传输只处理文件字节，适合先上传配置再独立审查和部署。自定义反向代理需允许 MCP 请求体至少 14 MiB。
+
+上传需要渠道策略有 `file:upload`、Agent 以 `full` 运行，而且启动时指定 `--upload-dir`。已有渠道保留原 scope，可为需要上传的目标签发一个新渠道。Agent 侧提前创建由运维方控制的目标目录。目录参数可重复设置，也允许该目录下的子目录。
+
+```bash
+# Hub 管理终端签发一次
+./bin/revmcp-hub token issue --config hub.channels.local.yaml \
+  --name deploy-app01 --allowed-target app01 --mode full \
+  --scope read --scope file:upload
+
+# 在 APP01 启动 Agent，加载上一步的 enrollment_token
+./revmcp-agent-linux-amd64 --hub wss://mcp.example.com/agent/ws \
+  --target-id app01 --mode full --upload-dir /data/deploy
+```
+
+在文件所在机器使用发行包里的 `revmcp-hub file`。环境变量 `REVMCP_BEARER_TOKEN` 使用该渠道的 `mcp_bearer`。CLI 从磁盘读取或写入文件，只输出大小和 SHA-256。
+
+```bash
+./bin/revmcp-hub file upload --endpoint https://mcp.example.com/mcp \
+  --target app01 --local ./infrastructure.yaml --remote /data/deploy/infrastructure.yaml
+
+./bin/revmcp-hub file download --endpoint https://mcp.example.com/mcp/app01 \
+  --remote /data/deploy/infrastructure.yaml --local ./infrastructure.received.yaml
+```
+
+省略 `--overwrite` 时，目标已存在会拒绝。显式覆盖会以权限 `0600` 的新文件替换旧文件。路径须为绝对远端路径，父目录必须存在，上传和下载均拒绝远端符号链接及特殊文件。下载沿用 `--allow-path`、`--deny-path` 及默认敏感路径保护。上传使用独立的 `--upload-dir`，同时执行 `--deny-path` 和默认敏感路径保护。
+
+直接调用 MCP 时，`upload_file` 接收 `path`、原始字节数 `size`、小写十六进制 `sha256`、`content_base64` 和可选的 `overwrite`。`download_file` 接收 `path`，返回 `remote_output` 内的 Base64 和结构化的 `size`、`sha256`。聚合端点还需要 `target_id`。较大文件推荐用 CLI，以免把文件内容带入 AI 上下文。
 
 ## 版本发布
 

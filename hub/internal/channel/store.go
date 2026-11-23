@@ -281,7 +281,7 @@ func (p Policy) Validate() error {
 	}
 	for _, scope := range p.MCPScopes {
 		switch scope {
-		case "read", "exec:restricted", "exec:full", "exec:session":
+		case "read", "exec:restricted", "exec:full", "exec:session", "file:upload":
 		default:
 			return fmt.Errorf("%w: unsupported MCP scope", ErrInvalid)
 		}

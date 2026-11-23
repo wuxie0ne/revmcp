@@ -63,6 +63,7 @@ func main() {
 		noDefaultDeny bool
 		showVersion   bool
 		allowPaths    listFlags
+		uploadDirs    listFlags
 		denyPaths     listFlags
 		tags          = make(tagFlags)
 	)
@@ -74,10 +75,11 @@ func main() {
 	flag.StringVar(&modeRaw, "mode", string(proto.ModeReadOnly), "Permission mode: readonly | restricted | full")
 	flag.DurationVar(&ttl, "ttl", 0, "Optional auto-exit duration (e.g. 2h)")
 	flag.BoolVar(&selfDestruct, "self-destruct-on-exit", false, "Remove agent binary from disk upon exit")
-	flag.BoolVar(&noDefaultDeny, "no-default-deny", false, "Disable built-in sensitive path denylist for fs.read/fs.grep")
+	flag.BoolVar(&noDefaultDeny, "no-default-deny", false, "Disable built-in sensitive path denylist for file tools")
 	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
-	flag.Var(&allowPaths, "allow-path", "Optional allowed file path glob/prefix for fs.read/fs.grep (repeatable)")
-	flag.Var(&denyPaths, "deny-path", "Optional denied file path glob/prefix for fs.read/fs.grep (repeatable)")
+	flag.Var(&allowPaths, "allow-path", "Optional allowed file path glob/prefix for read tools (repeatable)")
+	flag.Var(&denyPaths, "deny-path", "Optional denied file path glob/prefix for file tools (repeatable)")
+	flag.Var(&uploadDirs, "upload-dir", "Enable file uploads under this absolute directory in full mode (repeatable)")
 	flag.Var(tags, "tag", "Optional target metadata tag in key=value format (repeatable)")
 	flag.Parse()
 
@@ -87,6 +89,13 @@ func main() {
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	for _, dir := range uploadDirs {
+		if err := fsread.ValidateUploadDir(dir); err != nil {
+			logger.Error("invalid --upload-dir", "dir", dir, "err", err)
+			os.Exit(2)
+		}
+	}
 
 	if token == "" {
 		token = os.Getenv("REVMCP_ENROLL_TOKEN")
@@ -222,6 +231,22 @@ func main() {
 			}
 			return res, nil
 
+		case proto.MethodFSDownload:
+			var p proto.FSDownloadRequest
+			if err := json.Unmarshal(req.Params, &p); err != nil {
+				return nil, &proto.RPCError{Code: proto.ErrCodeInvalidArgument, Message: err.Error()}
+			}
+			res, err := fileReader.Download(rpcCtx, p.Path)
+			return res, transferRPCError(err)
+
+		case proto.MethodFSUpload:
+			var p proto.FSUploadRequest
+			if err := json.Unmarshal(req.Params, &p); err != nil {
+				return nil, &proto.RPCError{Code: proto.ErrCodeInvalidArgument, Message: err.Error()}
+			}
+			res, err := fileReader.Upload(rpcCtx, uploadDirs, p, req.Data)
+			return res, transferRPCError(err)
+
 		case proto.MethodCmdExec:
 			var p proto.CmdExecRequest
 			if err := json.Unmarshal(req.Params, &p); err != nil {
@@ -312,16 +337,17 @@ func main() {
 		Token:      token,
 		CACertPath: caCertPath,
 		AgentInfo: proto.AgentInfo{
-			TargetID:    targetID,
-			Hostname:    hostname,
-			OS:          runtime.GOOS,
-			Kernel:      kernel,
-			Arch:        runtime.GOARCH,
-			InContainer: inContainer,
-			Mode:        mode,
-			Version:     version,
-			Tags:        tags,
-			StartedAt:   startedAt,
+			TargetID:     targetID,
+			Hostname:     hostname,
+			OS:           runtime.GOOS,
+			Kernel:       kernel,
+			Arch:         runtime.GOARCH,
+			InContainer:  inContainer,
+			Mode:         mode,
+			Version:      version,
+			Tags:         tags,
+			StartedAt:    startedAt,
+			FileTransfer: true,
 		},
 		Handler: handler,
 		Logger:  logger,
@@ -343,6 +369,24 @@ func main() {
 			logger.Info("self-destruct completed")
 		}
 	}
+}
+
+func transferRPCError(err error) *proto.RPCError {
+	if err == nil {
+		return nil
+	}
+	code := proto.ErrCodeInternal
+	switch {
+	case errors.Is(err, fsread.ErrPathDenied):
+		code = proto.ErrCodePolicyDenied
+	case errors.Is(err, fsread.ErrInvalidPath), errors.Is(err, os.ErrExist):
+		code = proto.ErrCodeInvalidArgument
+	case errors.Is(err, os.ErrNotExist):
+		code = proto.ErrCodeNotFound
+	case errors.Is(err, context.Canceled):
+		code = proto.ErrCodeCancelled
+	}
+	return &proto.RPCError{Code: code, Message: err.Error()}
 }
 
 func removeSelfBinary() error {

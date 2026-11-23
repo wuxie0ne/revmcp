@@ -112,11 +112,9 @@ func (r *Reader) checkPathPolicy(cleanedPath string) error {
 		candidates = append(candidates, filepath.Clean(resolved))
 	}
 
-	for _, c := range candidates {
-		for _, deny := range r.denyPatterns {
-			if matchPathPattern(deny, c) {
-				return fmt.Errorf("%w: %q matches deny rule %q", ErrPathDenied, cleanedPath, deny)
-			}
+	for _, candidate := range candidates {
+		if err := r.checkDeniedPaths(cleanedPath, candidate); err != nil {
+			return err
 		}
 	}
 
@@ -135,6 +133,15 @@ func (r *Reader) checkPathPolicy(cleanedPath string) error {
 		}
 	}
 
+	return nil
+}
+
+func (r *Reader) checkDeniedPaths(path, candidate string) error {
+	for _, deny := range r.denyPatterns {
+		if matchPathPattern(deny, candidate) {
+			return fmt.Errorf("%w: %q matches deny rule %q", ErrPathDenied, path, deny)
+		}
+	}
 	return nil
 }
 

@@ -41,7 +41,7 @@ func (g *Guard) CheckMethod(method string) error {
 	switch method {
 	case proto.MethodAgentRegister, proto.MethodAgentPing, proto.MethodAgentShutdown:
 		return nil
-	case proto.MethodSysInfo, proto.MethodProcList, proto.MethodNetSockets, proto.MethodFSRead, proto.MethodFSGrep:
+	case proto.MethodSysInfo, proto.MethodProcList, proto.MethodNetSockets, proto.MethodFSRead, proto.MethodFSGrep, proto.MethodFSDownload:
 		if !g.mode.Allows(proto.ModeReadOnly) {
 			return fmt.Errorf("%w: %s requires %s", ErrModeDenied, method, proto.ModeReadOnly)
 		}
@@ -51,7 +51,7 @@ func (g *Guard) CheckMethod(method string) error {
 			return fmt.Errorf("%w: %s requires %s", ErrModeDenied, method, proto.ModeRestricted)
 		}
 		return nil
-	case proto.MethodSessionOpen, proto.MethodSessionExec, proto.MethodSessionClose:
+	case proto.MethodFSUpload, proto.MethodSessionOpen, proto.MethodSessionExec, proto.MethodSessionClose:
 		if !g.mode.Allows(proto.ModeFull) {
 			return fmt.Errorf("%w: %s requires %s", ErrModeDenied, method, proto.ModeFull)
 		}

@@ -27,6 +27,13 @@ func TestGuardModesFailClosed(t *testing.T) {
 	if err := ro.CheckMethod(proto.MethodSessionOpen); !errors.Is(err, ErrModeDenied) {
 		t.Fatalf("readonly must deny session.open, got: %v", err)
 	}
+	if err := ro.CheckMethod(proto.MethodFSDownload); err != nil {
+		t.Fatalf("readonly should allow fs.download: %v", err)
+	}
+	if err := ro.CheckMethod(proto.MethodFSUpload); !errors.Is(err, ErrModeDenied) {
+		t.Fatalf("readonly must deny fs.upload: %v", err)
+	}
+
 	if err := ro.CheckMethod("unknown.method"); !errors.Is(err, ErrModeDenied) {
 		t.Fatalf("unknown method must fail closed, got: %v", err)
 	}
@@ -41,6 +48,10 @@ func TestGuardModesFailClosed(t *testing.T) {
 	if err := restricted.CheckMethod(proto.MethodSessionOpen); !errors.Is(err, ErrModeDenied) {
 		t.Fatalf("restricted must deny session.open, got: %v", err)
 	}
+	if err := restricted.CheckMethod(proto.MethodFSUpload); !errors.Is(err, ErrModeDenied) {
+		t.Fatalf("restricted must deny fs.upload: %v", err)
+	}
+
 }
 
 func TestRestrictedASTAllowedCommands(t *testing.T) {

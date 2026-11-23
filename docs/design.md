@@ -55,7 +55,7 @@
 ### 级联取消机制
 - 每条 `yamux.Stream` 承载一次独立 RPC（1 Request + 1 Response）。
 - Hub 在 `ctx.Done()` 时立即调用 `stream.Close()`；
-- Agent 端 RPC 分发器在读完请求帧后启动轻量 watcher goroutine 监听该 `stream` 的 `EOF`/重置事件，一旦对端关闭流立即 `cancel()` 当前 handler 的 `context`，触发 `syscall.Kill(-pid, syscall.SIGKILL)` 查杀进程组。
+- Agent 端 RPC 分发器在读完请求帧和上传字节后启动轻量 watcher goroutine 监听该 `stream` 的 `EOF`/重置事件，一旦对端关闭流立即 `cancel()` 当前 handler 的 `context`，触发 `syscall.Kill(-pid, syscall.SIGKILL)` 查杀进程组。
 
 ## 3. 南向内部 RPC 协议（长度前缀 + JSON）
 
@@ -65,8 +65,11 @@
 +------------------+----------------------------------------+
 ```
 
-- 单帧最大上限：`2MB`（`proto.MaxFrameSize`），超限立即拒绝以防 OOM。
+- 单帧最大上限：`2 MiB`（`proto.MaxFrameSize`），超限立即拒绝以防 OOM。
 - `Response` 使用结构化 `RPCError{Code, Message, Retryable}`，便于 Hub 准确映射为 MCP Tool 错误与审计决策。
+- 注册元数据 `file_transfer` 表示 Agent 支持新文件 RPC。旧 Agent 的其他 RPC 无需更新。
+- `fs.upload` 的请求 JSON 帧声明路径、原始大小、SHA-256 和覆盖策略。紧接着传声明数量的原始文件字节，响应仍为 JSON 帧。
+- `fs.download` 的成功响应 JSON 帧声明原始大小和 SHA-256，紧接着传原始字节。双方限长 10,000,000 字节，保留 2 MiB JSON 单帧上限。Hub 在回传下载前重新校验长度及摘要。
 
 ### RPC 方法表
 
@@ -78,6 +81,8 @@
 | `proc.list` | Hub -> Agent | 纯 Go 读 `/proc/[pid]` 返回进程列表 | `readonly` |
 | `net.sockets` | Hub -> Agent | 纯 Go 读 `/proc/net/tcp{,6},udp{,6}` 返回监听端口与连接统计 | `readonly` |
 | `fs.read` | Hub -> Agent | 分块或尾部读取常规/伪文件（拒绝阻塞设备与 FIFO） | `readonly` |
+| `fs.upload` | Hub -> Agent | 校验后将单文件原子落盘 | `full` 与显式上传目录 |
+| `fs.download` | Hub -> Agent | 在只读路径策略内读取单个常规文件 | `readonly` |
 | `fs.grep` | Hub -> Agent | 流式正则检索文件（限制单行扫描与最大匹配数） | `readonly` |
 | `cmd.exec` | Hub -> Agent | 无状态执行单条命令（`restricted` 下走 AST 白名单校验） | `restricted` / `full` |
 | `session.open/exec/close` | Hub -> Agent | 持久化有状态 Shell 会话管理 | `full` |
@@ -92,6 +97,12 @@
   - `/mcp`：聚合端点，所有远程工具均接收 `target_id`；
   - `/mcp/{target_id}`：单机隔离端点，工具 Schema 隐藏 `target_id`，在路由层绑定目标并校验权限，防止跨机误操作。
 - 所有来自目标机的不可信文本输出必须包裹在 `<remote_output target="..." exit_code="..." truncated="...">...</remote_output>` 边界标签中（并对内嵌 `</remote_output>` 转义）。
+
+### 单文件传输
+
+- `upload_file` 与 `download_file` 共用原有 MCP 通道和认证。MCP JSON 使用 Base64，HTTP 请求体上限为 14 MiB。下载元数据以结构化方式返回，文件字节的 Base64 表示包裹在 `remote_output` 内。
+- 上传仅授予具有 `file:upload` 的 Bearer，且 Hub 和 Agent 均检查 `full` 模式。Agent 仅在现有 `--upload-dir` 子路径下落盘，执行敏感及自定义禁止路径规则，通过目录描述符逐级打开路径并拒绝符号链接。
+- 上传在同一目录暂存并同步文件，在最终路径原子发布。默认使用链接确保目标已存在时失败。显式覆盖使用原子重命名。内容和凭证原值不进入审计。
 
 ### Admin HTTP API
 

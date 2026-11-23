@@ -51,6 +51,11 @@ func main() {
 			_, _ = fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
+	case "file":
+		if err := runFile(os.Args[2:]); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
 	case "target":
 		if err := runTarget(os.Args[2:]); err != nil {
 			_, _ = fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -73,6 +78,7 @@ func printUsage() {
 	_, _ = fmt.Fprintln(os.Stderr, "  revmcp-hub channel delete --config <path> --name <channel>")
 	_, _ = fmt.Fprintln(os.Stderr, "  revmcp-hub target kick --config <path> --channel <name> --target <id> [--reason <msg>] [--self-destruct]")
 	_, _ = fmt.Fprintln(os.Stderr, "  revmcp-hub target kick --config <path> --expired [--reason <msg>]")
+	_, _ = fmt.Fprintln(os.Stderr, "  revmcp-hub file upload | download --endpoint <MCP URL> [--target <id>] --local <path> --remote <path> [--overwrite]")
 	_, _ = fmt.Fprintln(os.Stderr, "  revmcp-hub version")
 }
 

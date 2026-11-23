@@ -276,6 +276,10 @@ func (c *sessionCaller) Call(ctx context.Context, method string, params any, res
 		return fmt.Errorf("tunnel: open stream: %w", err)
 	}
 
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = stream.SetDeadline(deadline)
+	}
+
 	done := make(chan struct{})
 	defer close(done)
 
@@ -283,6 +287,7 @@ func (c *sessionCaller) Call(ctx context.Context, method string, params any, res
 	go func() {
 		select {
 		case <-ctx.Done():
+			_ = stream.SetDeadline(time.Now())
 			_ = stream.Close()
 		case <-done:
 		}
@@ -311,6 +316,12 @@ func (c *sessionCaller) Call(ctx context.Context, method string, params any, res
 		return fmt.Errorf("tunnel: write request: %w", err)
 	}
 
+	if upload, ok := params.(proto.FileUpload); ok {
+		if err := proto.WriteFilePayload(stream, upload.Data); err != nil {
+			return err
+		}
+	}
+
 	var resp proto.Response
 	if err := proto.ReadFrame(stream, &resp); err != nil {
 		if ctx.Err() != nil {
@@ -326,6 +337,17 @@ func (c *sessionCaller) Call(ctx context.Context, method string, params any, res
 			return fmt.Errorf("tunnel: unmarshal result: %w", err)
 		}
 	}
+	if download, ok := resultDst.(*proto.FileDownload); ok {
+		data, err := proto.ReadFilePayload(stream, download.Size)
+		if err != nil {
+			return err
+		}
+		if err := proto.ValidateFilePayload(download.Size, download.SHA256, data); err != nil {
+			return err
+		}
+		download.Data = data
+	}
+
 	return nil
 }
 

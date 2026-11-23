@@ -129,7 +129,7 @@ func TestRealAgentBinaryFullLifecycleAndSelfDestruct(t *testing.T) {
 		return detail
 	}
 	credentials := issue("e2e", "e2e-node-01", proto.ModeFull,
-		policy.ScopeRead, policy.ScopeExecRestricted, policy.ScopeExecFull, policy.ScopeExecSession)
+		policy.ScopeRead, policy.ScopeExecRestricted, policy.ScopeExecFull, policy.ScopeExecSession, policy.ScopeFileUpload)
 
 	reg := registry.New()
 	var auditBuf syncBuffer
@@ -159,6 +159,7 @@ func TestRealAgentBinaryFullLifecycleAndSelfDestruct(t *testing.T) {
 		"--target-id", "e2e-node-01",
 		"--mode", "full",
 		"--tag", "env=e2e",
+		"--upload-dir", tmpDir,
 	)
 	if err := agentCmd.Start(); err != nil {
 		t.Fatalf("start agent binary: %v", err)
@@ -193,6 +194,11 @@ func TestRealAgentBinaryFullLifecycleAndSelfDestruct(t *testing.T) {
 	if status != http.StatusOK || !strings.Contains(body, "mounts") || !strings.Contains(body, "remote_output") {
 		t.Fatalf("get_system_info failed: status=%d body=%s", status, body)
 	}
+
+	t.Run("SingleFileTransfer", func(t *testing.T) {
+		readOnly := issue("transfer-read", "e2e-node-01", proto.ModeReadOnly, policy.ScopeRead)
+		checkFileTransfer(t, mcpTS.URL, credentials.Bearer, readOnly.Bearer, tmpDir, &auditBuf)
+	})
 
 	// 2. Default deny policy blocks /etc/shadow over real RPC.
 	status, body = mcpCall(t, ctx, mcpTS.URL+"/mcp/e2e-node-01", credentials.Bearer, map[string]any{
